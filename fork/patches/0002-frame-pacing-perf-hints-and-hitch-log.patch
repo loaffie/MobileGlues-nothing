@@ -1,0 +1,497 @@
+diff --git a/MobileGlues-cpp/CMakeLists.txt b/MobileGlues-cpp/CMakeLists.txt
+index 0426186..00bb17b 100644
+--- a/MobileGlues-cpp/CMakeLists.txt
++++ b/MobileGlues-cpp/CMakeLists.txt
+@@ -100,6 +100,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
+     gl/texture.cpp
+     gl/drawing.cpp
+     gl/multidraw.cpp
++    gl/frametime.cpp
+     bench/multidraw_bench.cpp
+     gl/mg.cpp
+     gl/buffer.cpp
+diff --git a/MobileGlues-cpp/egl/egl.cpp b/MobileGlues-cpp/egl/egl.cpp
+index 61b2759..87e12f4 100644
+--- a/MobileGlues-cpp/egl/egl.cpp
++++ b/MobileGlues-cpp/egl/egl.cpp
+@@ -9,6 +9,7 @@
+ #include "context.h"
+ #include "../config/settings.h"
+ #include "../gl/FSR1/FSR1.h"
++#include "../gl/frametime.h"
+ #include "../gl/log.h"
+ #include "../gl/mg.h"
+ #include "../gles/loader.h"
+@@ -408,10 +409,21 @@ namespace {
+     EGLBoolean presentSurface(EGLDisplay dpy, EGLSurface surface) {
+         LOAD_EGL(eglSwapBuffers)
+         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
+-            return egl_eglSwapBuffers(dpy, surface);
++            EGLBoolean result;
++            {
++                mg_ft_scope_t ft(MG_FT_SWAP);
++                result = egl_eglSwapBuffers(dpy, surface);
++            }
++            mg_frame_presented();
++            return result;
+         }
+         ApplyFSR();
+-        const EGLBoolean result = egl_eglSwapBuffers(dpy, surface);
++        EGLBoolean result;
++        {
++            mg_ft_scope_t ft(MG_FT_SWAP);
++            result = egl_eglSwapBuffers(dpy, surface);
++        }
++        mg_frame_presented();
+         CheckResolutionChange(dpy, surface);
+         return result;
+     }
+diff --git a/MobileGlues-cpp/gl/buffer.cpp b/MobileGlues-cpp/gl/buffer.cpp
+index d8fd66d..2f7e547 100644
+--- a/MobileGlues-cpp/gl/buffer.cpp
++++ b/MobileGlues-cpp/gl/buffer.cpp
+@@ -12,6 +12,7 @@
+ #include <ska/flat_hash_map.hpp>
+ #include <array>
+ #include "texture.h"
++#include "frametime.h"
+ 
+ #define DEBUG 0
+ 
+@@ -1013,6 +1014,7 @@ struct borrowed_target_t {
+ 
+ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_BUFFER);
+     LOG_D("glBufferData, target = %s, size = %d, data = 0x%x, usage = %s", glEnumToString(target), size, data,
+           glEnumToString(usage))
+     borrowed_target_t t(target);
+@@ -1025,6 +1027,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
+ // so that GL_PARAMETER_BUFFER reaches the driver as a target it understands.
+ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_BUFFER);
+     LOG_D("glBufferSubData, target = %s, offset = %p, size = %zi", glEnumToString(target), (void*)offset, size)
+     borrowed_target_t t(target);
+     GLES.glBufferSubData(t.target, offset, size, data);
+@@ -1089,6 +1092,7 @@ extern "C"
+ 
+ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_MAP);
+     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
+     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
+     borrowed_target_t t(target);
+@@ -1097,6 +1101,7 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
+ 
+ GLboolean glUnmapBuffer(GLenum target) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_MAP);
+     LOG_D("%s(%s)", __func__, glEnumToString(target));
+     borrowed_target_t t(target);
+     if (g_gles_caps.GL_OES_mapbuffer) return GLES.glUnmapBuffer(t.target);
+@@ -1108,6 +1113,7 @@ GLboolean glUnmapBuffer(GLenum target) {
+ 
+ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfield flags) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_BUFFER);
+     if (GLES.glBufferStorageEXT) {
+         if (global_settings.buffer_coherent_as_flush &&
+             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
+diff --git a/MobileGlues-cpp/gl/frametime.cpp b/MobileGlues-cpp/gl/frametime.cpp
+new file mode 100644
+index 0000000..d0e4d0a
+--- /dev/null
++++ b/MobileGlues-cpp/gl/frametime.cpp
+@@ -0,0 +1,226 @@
++// MobileGlues - gl/frametime.cpp
++// Copyright (c) 2025-2026 MobileGL-Dev
++// Licensed under the GNU Lesser General Public License v2.1:
++//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
++// SPDX-License-Identifier: LGPL-2.1-only
++// End of Source File Header
++
++#include "frametime.h"
++#include "../config/config.h"
++#include "log.h"
++#include "mg.h"
++
++#include <cstdio>
++
++#ifdef __ANDROID__
++#include <dlfcn.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
++#define DEBUG 0
++
++// On until the first presented frame has read the config, so the frames before
++// it are measured too. They are never reported: the warm-up below skips them.
++bool g_mg_ft_enabled = true;
++thread_local mg_ft_frame_t g_mg_ft_frame = {};
++
++namespace {
++
++// config.json:
++//   "hitchLog": 0            turn the hitch log and the 30 s summary off
++//   "perfHintTargetFps": N   frame rate the CPU hints aim for (default 120),
++//                            0 turns the hints off
++int g_cfg_read = 0;
++int g_cfg_hitch_log = 1;
++int g_cfg_target_fps = 120;
++
++void read_config_once() {
++    if (g_cfg_read) return;
++    g_cfg_read = 1;
++    const int hitch = config_get_int(const_cast<char*>("hitchLog"));
++    if (hitch == 0) g_cfg_hitch_log = 0;
++    const int fps = config_get_int(const_cast<char*>("perfHintTargetFps"));
++    if (fps == 0) {
++        g_cfg_target_fps = 0;
++    } else if (fps > 0) {
++        g_cfg_target_fps = fps < 20 ? 20 : (fps > 240 ? 240 : fps);
++    }
++    g_mg_ft_enabled = g_cfg_hitch_log != 0;
++    LOG_V("[MobileGlues] Setting: hitchLog                    = %d", g_cfg_hitch_log)
++    LOG_V("[MobileGlues] Setting: perfHintTargetFps           = %d", g_cfg_target_fps)
++}
++
++// ---------------------------------------------------------------------------
++// Performance hints (Android Dynamic Performance Framework, API 33+)
++//
++// The scheduler picks a CPU frequency from how busy a thread has been lately,
++// which is always a few frames late: a frame that suddenly needs more work --
++// the camera turns, a batch of chunks arrives -- runs at the frequency that was
++// enough for the cheap frames before it. A hint session reports how long each
++// frame really took against how long it was allowed to take, and the platform
++// uses that to raise the thread's frequency and core placement directly.
++//
++// Resolved with dlsym because this library is built for API levels that predate
++// the functions. Any failure simply leaves the hints off.
++// ---------------------------------------------------------------------------
++#ifdef __ANDROID__
++typedef void* (*pfn_get_manager_t)();
++typedef void* (*pfn_create_session_t)(void* manager, const int32_t* tids, size_t count, int64_t target_ns);
++typedef int (*pfn_report_t)(void* session, int64_t actual_ns);
++typedef void (*pfn_close_t)(void* session);
++
++int g_hint_resolved = 0; // 0 not tried, 1 usable, -1 unavailable
++pfn_get_manager_t g_hint_get_manager = nullptr;
++pfn_create_session_t g_hint_create = nullptr;
++pfn_report_t g_hint_report = nullptr;
++pfn_close_t g_hint_close = nullptr;
++void* g_hint_manager = nullptr;
++
++thread_local void* t_hint_session = nullptr;
++thread_local bool t_hint_tried = false;
++
++bool hint_resolve() {
++    if (g_hint_resolved != 0) return g_hint_resolved > 0;
++    g_hint_resolved = -1;
++    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
++    if (!lib) return false;
++    g_hint_get_manager = reinterpret_cast<pfn_get_manager_t>(dlsym(lib, "APerformanceHint_getManager"));
++    g_hint_create = reinterpret_cast<pfn_create_session_t>(dlsym(lib, "APerformanceHint_createSession"));
++    g_hint_report = reinterpret_cast<pfn_report_t>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
++    g_hint_close = reinterpret_cast<pfn_close_t>(dlsym(lib, "APerformanceHint_closeSession"));
++    if (!g_hint_get_manager || !g_hint_create || !g_hint_report) return false;
++    g_hint_manager = g_hint_get_manager();
++    if (!g_hint_manager) return false;
++    g_hint_resolved = 1;
++    return true;
++}
++
++void hint_report(uint64_t frame_ns) {
++    if (g_cfg_target_fps <= 0) return;
++    if (!t_hint_session) {
++        // One attempt per thread: a device that refuses the session will refuse
++        // it again, and this runs every frame.
++        if (t_hint_tried) return;
++        t_hint_tried = true;
++        if (!hint_resolve()) {
++            LOG_V("[MobileGlues] perf hints: not available on this device")
++            return;
++        }
++        const int32_t tid = static_cast<int32_t>(syscall(SYS_gettid));
++        const int64_t target_ns = 1000000000ll / g_cfg_target_fps;
++        t_hint_session = g_hint_create(g_hint_manager, &tid, 1, target_ns);
++        LOG_V("[MobileGlues] perf hints: session %s for thread %d, target %d fps",
++              t_hint_session ? "created" : "refused", tid, g_cfg_target_fps)
++        if (!t_hint_session) return;
++    }
++    // The platform rejects non-positive durations.
++    if (frame_ns > 0) g_hint_report(t_hint_session, static_cast<int64_t>(frame_ns));
++}
++#else
++void hint_report(uint64_t) {}
++#endif
++
++// ---------------------------------------------------------------------------
++// Hitch log
++// ---------------------------------------------------------------------------
++
++struct pacing_state_t {
++    uint64_t last_present_ns = 0;
++    uint64_t frames = 0;
++    double avg_ms = 0.0; // moving average of ordinary frames
++
++    // 30 s summary window
++    uint64_t win_start_ns = 0;
++    uint32_t win_frames = 0;
++    uint32_t win_hitches = 0;
++    double win_sum_ms = 0.0;
++    double win_max_ms = 0.0;
++
++    uint32_t hitch_lines = 0;
++};
++
++thread_local pacing_state_t t_pacing;
++
++const uint64_t WARMUP_FRAMES = 240;
++const uint32_t MAX_HITCH_LINES = 400;
++const uint64_t SUMMARY_NS = 30ull * 1000000000ull;
++
++double ms(uint64_t ns) {
++    return static_cast<double>(ns) / 1e6;
++}
++
++} // namespace
++
++void mg_frame_presented() {
++    read_config_once();
++
++    pacing_state_t& p = t_pacing;
++    mg_ft_frame_t frame = g_mg_ft_frame;
++    g_mg_ft_frame = {};
++
++    const uint64_t now = mg_ft_now();
++    const uint64_t prev = p.last_present_ns;
++    p.last_present_ns = now;
++    if (prev == 0) return;
++
++    const uint64_t dt_ns = now - prev;
++    // A pause, a loading screen or the app going to the background. Not a frame.
++    if (dt_ns > 2000000000ull) {
++        p.win_start_ns = 0;
++        return;
++    }
++
++    hint_report(dt_ns);
++
++    if (!g_cfg_hitch_log) return;
++
++    const double dt = ms(dt_ns);
++    p.frames += 1;
++    if (p.avg_ms <= 0.0) p.avg_ms = dt;
++
++    const bool warm = p.frames > WARMUP_FRAMES;
++    // Long relative to recent frames AND by an amount someone would see.
++    const bool hitch = warm && dt > p.avg_ms * 1.8 && dt - p.avg_ms > 6.0;
++
++    // A hitch moves the average only a little, so a burst of them does not
++    // become the new normal and hide the rest.
++    const double sample = dt > p.avg_ms * 2.0 ? p.avg_ms * 2.0 : dt;
++    p.avg_ms += (sample - p.avg_ms) / 32.0;
++
++    if (hitch && p.hitch_lines < MAX_HITCH_LINES) {
++        p.hitch_lines += 1;
++        uint64_t inside = 0;
++        for (int i = 0; i < MG_FT_COUNT; ++i)
++            inside += frame.ns[i];
++        const double outside = dt - ms(inside);
++        // "elsewhere" is everything not timed here: the game's own code, the
++        // JVM (garbage collection included) and every GL call without a scope.
++        LOG_V("[hitch] %.1f ms (avg %.1f) | swap %.1f | multidraw %.1f x%u | buffer %.1f x%u | map %.1f x%u | "
++              "texture %.1f x%u | shader %.1f x%u | elsewhere %.1f",
++              dt, p.avg_ms, ms(frame.ns[MG_FT_SWAP]), ms(frame.ns[MG_FT_MULTIDRAW]), frame.calls[MG_FT_MULTIDRAW],
++              ms(frame.ns[MG_FT_BUFFER]), frame.calls[MG_FT_BUFFER], ms(frame.ns[MG_FT_MAP]),
++              frame.calls[MG_FT_MAP], ms(frame.ns[MG_FT_TEXTURE]), frame.calls[MG_FT_TEXTURE],
++              ms(frame.ns[MG_FT_SHADER]), frame.calls[MG_FT_SHADER], outside < 0.0 ? 0.0 : outside)
++    }
++
++    if (!warm) return;
++    if (p.win_start_ns == 0) {
++        p.win_start_ns = now;
++        p.win_frames = 0;
++        p.win_hitches = 0;
++        p.win_sum_ms = 0.0;
++        p.win_max_ms = 0.0;
++    }
++    p.win_frames += 1;
++    p.win_sum_ms += dt;
++    if (dt > p.win_max_ms) p.win_max_ms = dt;
++    if (hitch) p.win_hitches += 1;
++
++    if (now - p.win_start_ns >= SUMMARY_NS && p.win_frames > 0) {
++        const double avg = p.win_sum_ms / p.win_frames;
++        LOG_V("[frametime] %u frames in 30 s | avg %.2f ms (%.0f fps) | worst %.1f ms | hitches %u", p.win_frames,
++              avg, avg > 0.0 ? 1000.0 / avg : 0.0, p.win_max_ms, p.win_hitches)
++        p.win_start_ns = 0;
++    }
++}
+diff --git a/MobileGlues-cpp/gl/frametime.h b/MobileGlues-cpp/gl/frametime.h
+new file mode 100644
+index 0000000..c8d9be5
+--- /dev/null
++++ b/MobileGlues-cpp/gl/frametime.h
+@@ -0,0 +1,62 @@
++// MobileGlues - gl/frametime.h
++// Copyright (c) 2025-2026 MobileGL-Dev
++// Licensed under the GNU Lesser General Public License v2.1:
++//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
++// SPDX-License-Identifier: LGPL-2.1-only
++// End of Source File Header
++
++#ifndef MOBILEGLUES_FRAMETIME_H
++#define MOBILEGLUES_FRAMETIME_H
++
++#include <chrono>
++#include <cstdint>
++
++// Frame pacing: where a long frame spent its time, and telling the platform how
++// long frames take so it can keep the render thread's CPU fast enough.
++//
++// Everything is per thread, like the current context is. Nothing here takes a
++// lock, and a scope costs two clock reads when logging is on and one branch
++// when it is off.
++
++enum mg_ft_cat_t : int {
++    MG_FT_SWAP = 0,  // eglSwapBuffers, including any wait for the GPU or vsync
++    MG_FT_MULTIDRAW, // glMultiDraw* (Sodium's chunk draws)
++    MG_FT_BUFFER,    // glBufferData / glBufferSubData / glBufferStorage
++    MG_FT_MAP,       // glMapBufferRange / glUnmapBuffer
++    MG_FT_TEXTURE,   // glTexImage2D / glTexSubImage2D
++    MG_FT_SHADER,    // glShaderSource (GLSL translation) / glLinkProgram
++    MG_FT_COUNT
++};
++
++struct mg_ft_frame_t {
++    uint64_t ns[MG_FT_COUNT];
++    uint32_t calls[MG_FT_COUNT];
++};
++
++extern bool g_mg_ft_enabled;
++extern thread_local mg_ft_frame_t g_mg_ft_frame;
++
++inline uint64_t mg_ft_now() {
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count());
++}
++
++struct mg_ft_scope_t {
++    int cat;
++    uint64_t t0;
++    explicit mg_ft_scope_t(int c) : cat(c), t0(g_mg_ft_enabled ? mg_ft_now() : 0) {}
++    ~mg_ft_scope_t() {
++        if (t0 == 0) return;
++        mg_ft_frame_t& f = g_mg_ft_frame;
++        f.ns[cat] += mg_ft_now() - t0;
++        f.calls[cat] += 1;
++    }
++    mg_ft_scope_t(const mg_ft_scope_t&) = delete;
++    mg_ft_scope_t& operator=(const mg_ft_scope_t&) = delete;
++};
++
++// Called once per presented frame, after the swap has returned.
++void mg_frame_presented();
++
++#endif // MOBILEGLUES_FRAMETIME_H
+diff --git a/MobileGlues-cpp/gl/multidraw.cpp b/MobileGlues-cpp/gl/multidraw.cpp
+index 5a02c6e..71f47cd 100644
+--- a/MobileGlues-cpp/gl/multidraw.cpp
++++ b/MobileGlues-cpp/gl/multidraw.cpp
+@@ -18,6 +18,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "frametime.h"
++
+ #define DEBUG 0
+ 
+ void prepareForDraw();
+@@ -618,6 +620,7 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const v
+     // Validation and the context check happen inside the backend implementation,
+     // so they also cover the case where glXGetProcAddress handed that symbol to
+     // the application directly.
++    mg_ft_scope_t ft(MG_FT_MULTIDRAW);
+     func_ptr(mode, count, type, indices, primcount);
+ }
+ 
+@@ -650,6 +653,7 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
+         }
+     }
+ 
++    mg_ft_scope_t ft(MG_FT_MULTIDRAW);
+     func_ptr(mode, counts, type, indices, primcount, basevertex);
+ }
+ 
+diff --git a/MobileGlues-cpp/gl/program.cpp b/MobileGlues-cpp/gl/program.cpp
+index 4c3a9d2..0e28cf3 100644
+--- a/MobileGlues-cpp/gl/program.cpp
++++ b/MobileGlues-cpp/gl/program.cpp
+@@ -16,6 +16,7 @@
+ #include <iostream>
+ #include "../config/settings.h"
+ #include "drawing.h"
++#include "frametime.h"
+ 
+ #define DEBUG 0
+ 
+@@ -98,6 +99,7 @@ void GenerateDefaultFSSource() {
+ static UnorderedMap<unsigned, GLuint> DefaultFSMap; // essl version <-> shader id
+ void glLinkProgram(GLuint program) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_SHADER);
+ 
+     LOG_D("glLinkProgram(%d)", program)
+     if (!shaderInfo.converted.empty() && shaderInfo.frag_data_changed) {
+diff --git a/MobileGlues-cpp/gl/shader.cpp b/MobileGlues-cpp/gl/shader.cpp
+index cf4043d..ee4de3b 100644
+--- a/MobileGlues-cpp/gl/shader.cpp
++++ b/MobileGlues-cpp/gl/shader.cpp
+@@ -16,6 +16,7 @@
+ #include "glsl/glsl_for_es.h"
+ #include "../config/settings.h"
+ #include "FSR1/FSR1.h"
++#include "frametime.h"
+ 
+ #define DEBUG 0
+ 
+@@ -52,6 +53,7 @@ bool check_if_sampler_buffer_used(std::string str) {
+ 
+ void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_SHADER);
+     shaderInfo.id = 0;
+     shaderInfo.converted = "";
+     shaderInfo.frag_data_changed_converted.clear();
+diff --git a/MobileGlues-cpp/gl/texture.cpp b/MobileGlues-cpp/gl/texture.cpp
+index f4dd2f7..08d060a 100644
+--- a/MobileGlues-cpp/gl/texture.cpp
++++ b/MobileGlues-cpp/gl/texture.cpp
+@@ -24,6 +24,7 @@
+ #ifndef __APPLE__
+ #include <malloc.h>
+ #endif
++#include "frametime.h"
+ 
+ #include "../gles/gles.h"
+ #include "../gles/loader.h"
+@@ -881,6 +882,7 @@ void glTexImage1D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
+ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border,
+                   GLenum format, GLenum type, const GLvoid* pixels) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_TEXTURE);
+     LOG_D("mg_glTexImage2D,target: %s,level: %d,internalFormat: %s->%s,width: "
+           "%d,height: %d,border: %d,format: %s,type: %s, pixels: 0x%x",
+           glEnumToString(target), level, glEnumToString(internalFormat), glEnumToString(internalFormat), width, height,
+@@ -1459,6 +1461,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
+ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height,
+                      GLenum format, GLenum type, const void* pixels) {
+     LOG()
++    mg_ft_scope_t ft(MG_FT_TEXTURE);
+ 
+     LOG_D("glTexSubImage2D, target = %s, level = %d, xoffset = %d, yoffset = %d, "
+           "width = %d, height = %d, format = %s, type = %s, pixels = 0x%x",
