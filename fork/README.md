@@ -24,17 +24,22 @@ buffer, texture and shader entry points)
 - **Hitch log.** When a frame takes much longer than recent frames, one line goes to `/sdcard/MG/latest.log` saying
   where the time went, and every 30 s a summary line gives average, worst frame and hitch count:
 
-      [hitch] 34.2 ms (avg 9.1) | swap 20.1 | multidraw 1.2 x38 | buffer 0.3 x12 | map 0.1 x40 | texture 0.0 x0 | shader 12.0 x2 | elsewhere 0.5
+      [hitch] 34.2 ms (avg 9.1) | swap 0.5 | multidraw 1.2 x38 | draw 2.0 x310 | buffer 0.3 x12 | map 0.1 x40 | texture 0.0 x0 | shader 0.0 x0 | other-gl 3.1 x5200 | elsewhere 27.0
       [frametime] 3290 frames in 30 s | avg 9.12 ms (110 fps) | worst 34.2 ms | hitches 7
+      [frametime] all frames 30000 ms: swap 4.0% | multidraw 6.1% | ... | elsewhere 61.0%
+      [frametime] hitches    240 ms: swap 1.5% | multidraw 3.5% | ... | elsewhere 79.0%
 
-  `swap` is time inside `eglSwapBuffers` (waiting for the GPU or the display). `elsewhere` is everything not timed:
-  the game's own code, the JVM including garbage collection, and other GL calls.
+  `swap` is time inside `eglSwapBuffers`. `multidraw` is Sodium's chunk draws, `draw` every other draw call.
+  `other-gl` is every GL call forwarded to the driver unchanged and is only measured at `hitchLog` 2. `elsewhere`
+  is what remains: the game's own code and the JVM, including garbage collection.
 
 Both can be changed in `/sdcard/MG/config.json`:
 
 | Key | Meaning |
 | --- | --- |
 | `"perfHintTargetFps": 120` | Frame rate the CPU hints aim for. `0` turns the hints off. |
+| `"hitchLog": 2` | Times every GL call. Current default of this diagnostic build; costs some frame rate. |
+| `"hitchLog": 1` | Times only the calls most likely to stall. Cheap. |
 | `"hitchLog": 0` | Turns the hitch log and summary off. |
 
 ## Getting the APK

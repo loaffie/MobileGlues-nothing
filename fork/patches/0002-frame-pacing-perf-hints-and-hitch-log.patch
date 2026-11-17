@@ -98,12 +98,96 @@ index d8fd66d..2f7e547 100644
      if (GLES.glBufferStorageEXT) {
          if (global_settings.buffer_coherent_as_flush &&
              ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
+diff --git a/MobileGlues-cpp/gl/drawing.cpp b/MobileGlues-cpp/gl/drawing.cpp
+index d3c9619..1c5f116 100644
+--- a/MobileGlues-cpp/gl/drawing.cpp
++++ b/MobileGlues-cpp/gl/drawing.cpp
+@@ -6,6 +6,7 @@
+ // End of Source File Header
+ 
+ #include "drawing.h"
++#include "frametime.h"
+ #include "restart.h"
+ #include "buffer.h"
+ #include "framebuffer.h"
+@@ -201,6 +202,7 @@ void prepareForDraw() {
+ }
+ 
+ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawElementsInstanced, mode: %d, count: %d, type: %d, indices: %p, primcount: %d", mode, count, type,
+           indices, primcount)
+@@ -214,6 +216,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
+ }
+ 
+ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawElements, mode: %d, count: %d, type: %d, indices: %p", mode, count, type, indices)
+     prepareForDraw();
+@@ -298,6 +301,7 @@ void* basevertex_staging(size_t bytes) {
+ } // namespace
+ 
+ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawElementsBaseVertex, mode: %d, count: %d, type: %d, indices: %p, basevertex: %d", mode, count, type,
+           indices, basevertex);
+@@ -450,6 +454,7 @@ struct restart_guard_t {
+ } // namespace
+ 
+ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void* indices) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawRangeElements, mode: %d, start: %u, end: %u, count: %d, type: %d", mode, start, end, count, type)
+     prepareForDraw();
+@@ -464,6 +469,7 @@ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, G
+ 
+ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
+                                    const void* indices, GLint basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawRangeElementsBaseVertex, mode: %d, count: %d, type: %d, basevertex: %d", mode, count, type, basevertex)
+     prepareForDraw();
+@@ -481,6 +487,7 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
+ 
+ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                        GLsizei instancecount, GLint basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawElementsInstancedBaseVertex, mode: %d, count: %d, type: %d, instancecount: %d, basevertex: %d", mode,
+           count, type, instancecount, basevertex)
+@@ -517,6 +524,7 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type,
+ 
+ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount,
+                                        GLuint baseinstance) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawArraysInstancedBaseInstance, mode: %d, first: %d, count: %d, instancecount: %d, baseinstance: %u",
+           mode, first, count, instancecount, baseinstance)
+@@ -531,6 +539,7 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
+ 
+ void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                          GLsizei instancecount, GLuint baseinstance) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawElementsInstancedBaseInstance, mode: %d, count: %d, type: %d, instancecount: %d, baseinstance: %u",
+           mode, count, type, instancecount, baseinstance)
+@@ -543,6 +552,7 @@ void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type
+ 
+ void glDrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                                    GLsizei instancecount, GLint basevertex, GLuint baseinstance) {
++    mg_ft_scope_t mg_ft(MG_FT_DRAW);
+     LOG()
+     LOG_D("glDrawElementsInstancedBaseVertexBaseInstance, mode: %d, count: %d, basevertex: %d, baseinstance: %u", mode,
+           count, basevertex, baseinstance)
 diff --git a/MobileGlues-cpp/gl/frametime.cpp b/MobileGlues-cpp/gl/frametime.cpp
 new file mode 100644
-index 0000000..d0e4d0a
+index 0000000..851c987
 --- /dev/null
 +++ b/MobileGlues-cpp/gl/frametime.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,267 @@
 +// MobileGlues - gl/frametime.cpp
 +// Copyright (c) 2025-2026 MobileGL-Dev
 +// Licensed under the GNU Lesser General Public License v2.1:
@@ -129,23 +213,27 @@ index 0000000..d0e4d0a
 +// On until the first presented frame has read the config, so the frames before
 +// it are measured too. They are never reported: the warm-up below skips them.
 +bool g_mg_ft_enabled = true;
++bool g_mg_ft_all = false;
 +thread_local mg_ft_frame_t g_mg_ft_frame = {};
++thread_local int g_mg_ft_depth = 0;
 +
 +namespace {
 +
 +// config.json:
 +//   "hitchLog": 0            turn the hitch log and the 30 s summary off
++//   "hitchLog": 1            time the calls most likely to stall (default)
++//   "hitchLog": 2            also time every forwarded GL call; costs frame rate
 +//   "perfHintTargetFps": N   frame rate the CPU hints aim for (default 120),
 +//                            0 turns the hints off
 +int g_cfg_read = 0;
-+int g_cfg_hitch_log = 1;
++int g_cfg_hitch_log = 2; // diagnostic build: full timing unless config says otherwise
 +int g_cfg_target_fps = 120;
 +
 +void read_config_once() {
 +    if (g_cfg_read) return;
 +    g_cfg_read = 1;
 +    const int hitch = config_get_int(const_cast<char*>("hitchLog"));
-+    if (hitch == 0) g_cfg_hitch_log = 0;
++    if (hitch >= 0 && hitch <= 2) g_cfg_hitch_log = hitch;
 +    const int fps = config_get_int(const_cast<char*>("perfHintTargetFps"));
 +    if (fps == 0) {
 +        g_cfg_target_fps = 0;
@@ -153,6 +241,7 @@ index 0000000..d0e4d0a
 +        g_cfg_target_fps = fps < 20 ? 20 : (fps > 240 ? 240 : fps);
 +    }
 +    g_mg_ft_enabled = g_cfg_hitch_log != 0;
++    g_mg_ft_all = g_cfg_hitch_log >= 2;
 +    LOG_V("[MobileGlues] Setting: hitchLog                    = %d", g_cfg_hitch_log)
 +    LOG_V("[MobileGlues] Setting: perfHintTargetFps           = %d", g_cfg_target_fps)
 +}
@@ -242,6 +331,10 @@ index 0000000..d0e4d0a
 +    uint32_t win_hitches = 0;
 +    double win_sum_ms = 0.0;
 +    double win_max_ms = 0.0;
++    // Where the window's time went: over every frame, and over the hitches only.
++    uint64_t win_ns[MG_FT_COUNT] = {};
++    uint64_t win_hitch_ns[MG_FT_COUNT] = {};
++    double win_hitch_ms = 0.0;
 +
 +    uint32_t hitch_lines = 0;
 +};
@@ -249,7 +342,7 @@ index 0000000..d0e4d0a
 +thread_local pacing_state_t t_pacing;
 +
 +const uint64_t WARMUP_FRAMES = 240;
-+const uint32_t MAX_HITCH_LINES = 400;
++const uint32_t MAX_HITCH_LINES = 150;
 +const uint64_t SUMMARY_NS = 30ull * 1000000000ull;
 +
 +double ms(uint64_t ns) {
@@ -300,14 +393,17 @@ index 0000000..d0e4d0a
 +        for (int i = 0; i < MG_FT_COUNT; ++i)
 +            inside += frame.ns[i];
 +        const double outside = dt - ms(inside);
-+        // "elsewhere" is everything not timed here: the game's own code, the
-+        // JVM (garbage collection included) and every GL call without a scope.
-+        LOG_V("[hitch] %.1f ms (avg %.1f) | swap %.1f | multidraw %.1f x%u | buffer %.1f x%u | map %.1f x%u | "
-+              "texture %.1f x%u | shader %.1f x%u | elsewhere %.1f",
++        // "elsewhere" is everything not timed here: the game's own code and the
++        // JVM (garbage collection included), plus -- unless hitchLog is 2 -- the
++        // GL calls that are forwarded to the driver unchanged.
++        LOG_V("[hitch] %.1f ms (avg %.1f) | swap %.1f | multidraw %.1f x%u | draw %.1f x%u | buffer %.1f x%u | "
++              "map %.1f x%u | texture %.1f x%u | shader %.1f x%u | other-gl %.1f x%u | elsewhere %.1f",
 +              dt, p.avg_ms, ms(frame.ns[MG_FT_SWAP]), ms(frame.ns[MG_FT_MULTIDRAW]), frame.calls[MG_FT_MULTIDRAW],
-+              ms(frame.ns[MG_FT_BUFFER]), frame.calls[MG_FT_BUFFER], ms(frame.ns[MG_FT_MAP]),
-+              frame.calls[MG_FT_MAP], ms(frame.ns[MG_FT_TEXTURE]), frame.calls[MG_FT_TEXTURE],
-+              ms(frame.ns[MG_FT_SHADER]), frame.calls[MG_FT_SHADER], outside < 0.0 ? 0.0 : outside)
++              ms(frame.ns[MG_FT_DRAW]), frame.calls[MG_FT_DRAW], ms(frame.ns[MG_FT_BUFFER]),
++              frame.calls[MG_FT_BUFFER], ms(frame.ns[MG_FT_MAP]), frame.calls[MG_FT_MAP],
++              ms(frame.ns[MG_FT_TEXTURE]), frame.calls[MG_FT_TEXTURE], ms(frame.ns[MG_FT_SHADER]),
++              frame.calls[MG_FT_SHADER], ms(frame.ns[MG_FT_GL]), frame.calls[MG_FT_GL],
++              outside < 0.0 ? 0.0 : outside)
 +    }
 +
 +    if (!warm) return;
@@ -317,25 +413,54 @@ index 0000000..d0e4d0a
 +        p.win_hitches = 0;
 +        p.win_sum_ms = 0.0;
 +        p.win_max_ms = 0.0;
++        p.win_hitch_ms = 0.0;
++        for (int i = 0; i < MG_FT_COUNT; ++i)
++            p.win_ns[i] = p.win_hitch_ns[i] = 0;
 +    }
 +    p.win_frames += 1;
 +    p.win_sum_ms += dt;
 +    if (dt > p.win_max_ms) p.win_max_ms = dt;
-+    if (hitch) p.win_hitches += 1;
++    for (int i = 0; i < MG_FT_COUNT; ++i)
++        p.win_ns[i] += frame.ns[i];
++    if (hitch) {
++        p.win_hitches += 1;
++        p.win_hitch_ms += dt;
++        for (int i = 0; i < MG_FT_COUNT; ++i)
++            p.win_hitch_ns[i] += frame.ns[i];
++    }
 +
 +    if (now - p.win_start_ns >= SUMMARY_NS && p.win_frames > 0) {
 +        const double avg = p.win_sum_ms / p.win_frames;
 +        LOG_V("[frametime] %u frames in 30 s | avg %.2f ms (%.0f fps) | worst %.1f ms | hitches %u", p.win_frames,
 +              avg, avg > 0.0 ? 1000.0 / avg : 0.0, p.win_max_ms, p.win_hitches)
++        // The same split as a [hitch] line, summed: once over every frame of the
++        // window and once over its hitches. This is what survives the per-hitch
++        // line limit, and what makes two runs comparable.
++        for (int pass = 0; pass < 2; ++pass) {
++            const uint64_t* ns = pass == 0 ? p.win_ns : p.win_hitch_ns;
++            const double total = pass == 0 ? p.win_sum_ms : p.win_hitch_ms;
++            if (total <= 0.0) continue;
++            double inside = 0.0;
++            for (int i = 0; i < MG_FT_COUNT; ++i)
++                inside += ms(ns[i]);
++            const double outside = total > inside ? total - inside : 0.0;
++            LOG_V("[frametime] %s %.0f ms: swap %.1f%% | multidraw %.1f%% | draw %.1f%% | buffer %.1f%% | map %.1f%% | "
++                  "texture %.1f%% | shader %.1f%% | other-gl %.1f%% | elsewhere %.1f%%",
++                  pass == 0 ? "all frames" : "hitches   ", total, 100.0 * ms(ns[MG_FT_SWAP]) / total,
++                  100.0 * ms(ns[MG_FT_MULTIDRAW]) / total, 100.0 * ms(ns[MG_FT_DRAW]) / total,
++                  100.0 * ms(ns[MG_FT_BUFFER]) / total, 100.0 * ms(ns[MG_FT_MAP]) / total,
++                  100.0 * ms(ns[MG_FT_TEXTURE]) / total, 100.0 * ms(ns[MG_FT_SHADER]) / total,
++                  100.0 * ms(ns[MG_FT_GL]) / total, 100.0 * outside / total)
++        }
 +        p.win_start_ns = 0;
 +    }
 +}
 diff --git a/MobileGlues-cpp/gl/frametime.h b/MobileGlues-cpp/gl/frametime.h
 new file mode 100644
-index 0000000..c8d9be5
+index 0000000..bf84fa5
 --- /dev/null
 +++ b/MobileGlues-cpp/gl/frametime.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,84 @@
 +// MobileGlues - gl/frametime.h
 +// Copyright (c) 2025-2026 MobileGL-Dev
 +// Licensed under the GNU Lesser General Public License v2.1:
@@ -363,6 +488,8 @@ index 0000000..c8d9be5
 +    MG_FT_MAP,       // glMapBufferRange / glUnmapBuffer
 +    MG_FT_TEXTURE,   // glTexImage2D / glTexSubImage2D
 +    MG_FT_SHADER,    // glShaderSource (GLSL translation) / glLinkProgram
++    MG_FT_DRAW,      // glDrawElements* (everything the game draws that is not a multi-draw)
++    MG_FT_GL,        // every call forwarded to the driver unchanged; only timed at hitchLog 2
 +    MG_FT_COUNT
 +};
 +
@@ -372,7 +499,14 @@ index 0000000..c8d9be5
 +};
 +
 +extern bool g_mg_ft_enabled;
++// hitchLog 2: also time the forwarded calls. That is two clock reads on every GL
++// call the game makes, so it is a diagnosis setting, not one to play on.
++extern bool g_mg_ft_all;
 +extern thread_local mg_ft_frame_t g_mg_ft_frame;
++// Scopes nest -- a multi-draw backend falls back to another, glMapBuffer calls
++// glMapBufferRange -- and only the outermost one may count, or the same
++// nanoseconds are reported twice.
++extern thread_local int g_mg_ft_depth;
 +
 +inline uint64_t mg_ft_now() {
 +    return static_cast<uint64_t>(
@@ -383,15 +517,28 @@ index 0000000..c8d9be5
 +struct mg_ft_scope_t {
 +    int cat;
 +    uint64_t t0;
-+    explicit mg_ft_scope_t(int c) : cat(c), t0(g_mg_ft_enabled ? mg_ft_now() : 0) {}
++    explicit mg_ft_scope_t(int c) : mg_ft_scope_t(c, g_mg_ft_enabled) {}
++    mg_ft_scope_t(int c, bool on) : cat(c), t0(0) {
++        if (!on) return;
++        if (g_mg_ft_depth++ == 0) t0 = mg_ft_now();
++        counted = true;
++    }
 +    ~mg_ft_scope_t() {
++        if (!counted) return;
++        g_mg_ft_depth -= 1;
 +        if (t0 == 0) return;
 +        mg_ft_frame_t& f = g_mg_ft_frame;
 +        f.ns[cat] += mg_ft_now() - t0;
 +        f.calls[cat] += 1;
 +    }
++    bool counted = false;
 +    mg_ft_scope_t(const mg_ft_scope_t&) = delete;
 +    mg_ft_scope_t& operator=(const mg_ft_scope_t&) = delete;
++};
++
++// For the forwarded calls (gles/loader.h NATIVE_FUNCTION_HEAD).
++struct mg_ft_native_scope_t : mg_ft_scope_t {
++    mg_ft_native_scope_t() : mg_ft_scope_t(MG_FT_GL, g_mg_ft_all) {}
 +};
 +
 +// Called once per presented frame, after the swap has returned.
@@ -399,7 +546,7 @@ index 0000000..c8d9be5
 +
 +#endif // MOBILEGLUES_FRAMETIME_H
 diff --git a/MobileGlues-cpp/gl/multidraw.cpp b/MobileGlues-cpp/gl/multidraw.cpp
-index 5a02c6e..71f47cd 100644
+index b925887..1757441 100644
 --- a/MobileGlues-cpp/gl/multidraw.cpp
 +++ b/MobileGlues-cpp/gl/multidraw.cpp
 @@ -18,6 +18,8 @@
@@ -411,22 +558,416 @@ index 5a02c6e..71f47cd 100644
  #define DEBUG 0
  
  void prepareForDraw();
-@@ -618,6 +620,7 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const v
-     // Validation and the context check happen inside the backend implementation,
-     // so they also cover the case where glXGetProcAddress handed that symbol to
-     // the application directly.
-+    mg_ft_scope_t ft(MG_FT_MULTIDRAW);
-     func_ptr(mode, count, type, indices, primcount);
- }
+@@ -280,6 +282,14 @@ enum class md_probe_state_t { Unprobed, Working, Failed };
+ static bool g_indirect_cmds_inited = false;
+ static GLsizei g_cmdbufsize = 0;
+ static GLuint g_indirectbuffer = 0;
++// Next free command slot in g_indirectbuffer. The buffer is a stream: every
++// multi-draw appends its commands after the previous call's instead of
++// overwriting slot 0, so the driver is never asked to rewrite bytes a queued
++// draw still has to read. See prepare_indirect_buffer.
++static GLsizei g_cmdbufhead = 0;
++// Smallest store the stream is given. 32768 commands is 640 KiB, enough for the
++// several dozen multi-draws a frame of chunk rendering issues before it wraps.
++static const GLsizei MG_CMD_STREAM_MIN = 32768;
  
-@@ -650,6 +653,7 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
+ // Arrays commands are 16 bytes, element commands 20, and the capacity counters
+ // below are in commands, not bytes. Sharing one buffer between the two layouts
+@@ -342,6 +352,7 @@ static void multidraw_check_context() {
+     // objects belonging to whichever context *is* current.
+     g_indirect_cmds_inited = false;
+     g_cmdbufsize = 0;
++    g_cmdbufhead = 0;
+     g_indirectbuffer = 0;
+     g_arrays_indirectbuffer = 0;
+     g_arrays_cmdbufsize = 0;
+@@ -583,6 +594,7 @@ typedef void (*glMultiDrawElements_t)(GLenum, const GLsizei*, GLenum, const void
+ 
+ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                          GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     static glMultiDrawElements_t func_ptr = nullptr;
+ 
+     if (func_ptr == nullptr) {
+@@ -616,6 +628,7 @@ typedef void (*glMultiDrawElementsBaseVertex_t)(GLenum, GLsizei*, GLenum, const
+ 
+ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+                                    GLsizei primcount, const GLint* basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     static glMultiDrawElementsBaseVertex_t func_ptr = nullptr;
+ 
+     if (func_ptr == nullptr) {
+@@ -650,8 +663,11 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
+ 
+ // Returns false when the command buffer could not be prepared; the caller must
+ // then fall back rather than issue a draw from an unwritten buffer.
++//
++// The commands are written at *out_offset bytes into the buffer, not at 0; the
++// caller has to hand that offset to the indirect draw.
+ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const void* const* indices, GLsizei primcount,
+-                                    const GLint* basevertex, GLuint* out_prev_binding) {
++                                    const GLint* basevertex, GLuint* out_prev_binding, size_t* out_offset) {
+     if (primcount <= 0) return false;
+ 
+     const GLsizei elementSize = mg_index_size(type);
+@@ -684,43 +700,65 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
+     }
+     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffer);
+ 
+-    if (g_cmdbufsize < primcount) {
+-        size_t sz = g_cmdbufsize > 0 ? static_cast<size_t>(g_cmdbufsize) : 1;
+-        while (sz < static_cast<size_t>(primcount))
++    // The store is a stream, not a single slot.
++    //
++    // Sodium issues one multi-draw per region per render pass, several dozen a
++    // frame, and each used to glBufferSubData its commands over offset 0 of the
++    // same buffer -- while the draws queued by the previous call still had to
++    // read those bytes. A tiled GPU does not execute a draw when it is issued, so
++    // the driver can only honour that by renaming the store (allocate, copy) or
++    // by flushing the pass and waiting for it, and it has to choose again on
++    // every call. Either shows up as frame time that scales with how many
++    // regions are visible, which is exactly what changes when the camera turns
++    // or new chunks arrive.
++    //
++    // Appending instead means no call ever touches a byte that a pending draw
++    // references. When the stream is full the store is orphaned -- a fresh
++    // glBufferData of the same size, which lets the driver detach the old
++    // memory without waiting for it -- and the stream starts over.
++    if (g_cmdbufsize < primcount || g_cmdbufhead > g_cmdbufsize - primcount) {
++        size_t sz = g_cmdbufsize > 0 ? static_cast<size_t>(g_cmdbufsize) : static_cast<size_t>(MG_CMD_STREAM_MIN);
++        // Room for a few calls of this size, so one unusually large batch does
++        // not turn every later call into an orphan.
++        while (sz < static_cast<size_t>(primcount) * 4)
+             sz *= 2;
++        const bool grew = sz != static_cast<size_t>(g_cmdbufsize);
+ 
+         const size_t wanted = sz * sizeof(draw_elements_indirect_command_t);
+-        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_DYNAMIC_DRAW);
++        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_STREAM_DRAW);
++        g_cmdbufhead = 0;
+ 
+         // Only record the new capacity once the store really grew. Assigning it
+         // unconditionally made an out-of-memory permanent: the tracked size then
+         // claimed more room than the buffer had, the resize branch was never
+         // taken again, and every later map ran past the end of the store.
+-        GLint real_size = 0;
+-        GLES.glGetBufferParameteriv(GL_DRAW_INDIRECT_BUFFER, GL_BUFFER_SIZE, &real_size);
+-        if (real_size < 0 || static_cast<size_t>(real_size) < wanted) {
+-            MD_WARN_ONCE("multidraw: indirect buffer allocation failed (wanted %zu bytes, got %d)", wanted, real_size);
+-            // The failed glBufferData leaves the store in an undefined state, so
+-            // the previously recorded capacity no longer describes it. Clearing it
+-            // forces a fresh allocation attempt next time; keeping the stale value
+-            // would skip the resize branch forever and make every later map fail.
+-            g_cmdbufsize = 0;
+-            GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
+-            return false;
++        //
++        // Asked only when the size changed. An orphan re-requests a size the
++        // driver has already granted, and this query is a round trip that would
++        // otherwise be paid on every wrap.
++        if (grew) {
++            GLint real_size = 0;
++            GLES.glGetBufferParameteriv(GL_DRAW_INDIRECT_BUFFER, GL_BUFFER_SIZE, &real_size);
++            if (real_size < 0 || static_cast<size_t>(real_size) < wanted) {
++                MD_WARN_ONCE("multidraw: indirect buffer allocation failed (wanted %zu bytes, got %d)", wanted,
++                             real_size);
++                // The failed glBufferData leaves the store in an undefined state, so
++                // the previously recorded capacity no longer describes it. Clearing it
++                // forces a fresh allocation attempt next time; keeping the stale value
++                // would skip the resize branch forever and make every later map fail.
++                g_cmdbufsize = 0;
++                GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
++                return false;
++            }
++            g_cmdbufsize = static_cast<GLsizei>(sz);
          }
+-        g_cmdbufsize = static_cast<GLsizei>(sz);
+-    }
+-
+-    // Built on the CPU and uploaded whole, rather than written through a
+-    // GL_MAP_INVALIDATE_BUFFER_BIT mapping. The mapping says "all of this is
+-    // about to be overwritten" more precisely, and on a driver that honours it
+-    // there is nothing to choose between the two. What it costs is two ways to
+-    // fail on every single draw call: a map that returns null, and an unmap that
+-    // reports the contents lost. Both used to abandon the backend for the rest of
+-    // the process, and falling back to unrolled draws forever is far more
+-    // expensive than the upload that was being avoided -- a driver refusing to
+-    // hand out a pointer for a buffer it is still reading is a perfectly ordinary
+-    // thing, not a reason to give up on indirect drawing.
++    }
++
++    // Built on the CPU first, then copied into the stream. A mapping can fail in
++    // two ways on any call -- a map that returns null, an unmap that reports the
++    // contents lost -- and both used to abandon the backend for the rest of the
++    // process. With the commands staged here neither is fatal: the same bytes go
++    // through glBufferSubData instead, for that one call only.
+     //
+     // thread_local for the same reason as mg_zero_basevertex: nothing in this
+     // file takes a lock, and two threads can each have a current context.
+@@ -749,8 +787,34 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
+         pcmds[i].reservedMustBeZero = 0;
      }
  
-+    mg_ft_scope_t ft(MG_FT_MULTIDRAW);
-     func_ptr(mode, counts, type, indices, primcount, basevertex);
+-    GLES.glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
+-                         static_cast<GLsizeiptr>(primcount * sizeof(draw_elements_indirect_command_t)), pcmds);
++    const size_t offset = static_cast<size_t>(g_cmdbufhead) * sizeof(draw_elements_indirect_command_t);
++    const size_t bytes = static_cast<size_t>(primcount) * sizeof(draw_elements_indirect_command_t);
++
++    // GL_MAP_UNSYNCHRONIZED_BIT is the point: it is a promise that nothing
++    // pending reads this range, which the append-only head guarantees, and it is
++    // what lets the driver hand the pointer out without waiting for the GPU or
++    // copying the store. glBufferSubData has no way to make that promise.
++    bool written = false;
++    if (GLES.glMapBufferRange && GLES.glUnmapBuffer) {
++        void* dst = GLES.glMapBufferRange(GL_DRAW_INDIRECT_BUFFER, static_cast<GLintptr>(offset),
++                                          static_cast<GLsizeiptr>(bytes),
++                                          GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++        if (dst) {
++            memcpy(dst, pcmds, bytes);
++            written = GLES.glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER) == GL_TRUE;
++        }
++        if (!written) {
++            MD_WARN_ONCE("multidraw: mapping the indirect command stream failed, uploading with glBufferSubData");
++            mg_md_drain(); // a refused map leaves an error behind
++        }
++    }
++    if (!written) {
++        GLES.glBufferSubData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes),
++                             pcmds);
++    }
++
++    g_cmdbufhead += primcount;
++    *out_offset = offset;
+     return true;
  }
  
+@@ -761,6 +825,7 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
+ void mg_glMultiDrawElementsBaseVertex_drawelements(GLenum mode, GLsizei* counts, GLenum type,
+                                                    const void* const* indices, GLsizei primcount,
+                                                    const GLint* basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(counts, type, primcount, indices)) return;
+ 
+@@ -872,6 +937,7 @@ void mg_glMultiDrawElementsBaseVertex_drawelements(GLenum mode, GLsizei* counts,
+ 
+ void mg_glMultiDrawElements_drawelements(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                          GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(count, type, primcount, indices)) return;
+ 
+@@ -898,6 +964,7 @@ void mg_glMultiDrawElements_drawelements(GLenum mode, const GLsizei* count, GLen
+ 
+ void mg_glMultiDrawElementsBaseVertex_indirect(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+                                                GLsizei primcount, const GLint* basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(counts, type, primcount, indices)) return;
+ 
+@@ -913,14 +980,15 @@ void mg_glMultiDrawElementsBaseVertex_indirect(GLenum mode, GLsizei* counts, GLe
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements_bv(md_backend_t::Indirect, mode, counts, type, indices, primcount, basevertex);
+         return;
+     }
+ 
+     for (GLsizei i = 0; i < primcount; ++i) {
+         if (counts[i] <= 0) continue;
+-        const GLvoid* offset = reinterpret_cast<GLvoid*>(i * sizeof(draw_elements_indirect_command_t));
++        const GLvoid* offset = reinterpret_cast<GLvoid*>(cmdOffset + i * sizeof(draw_elements_indirect_command_t));
+         GLES.glDrawElementsIndirect(mode, type, offset);
+     }
+ 
+@@ -931,6 +999,7 @@ void mg_glMultiDrawElementsBaseVertex_indirect(GLenum mode, GLsizei* counts, GLe
+ 
+ void mg_glMultiDrawElements_indirect(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                      GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(count, type, primcount, indices)) return;
+ 
+@@ -946,14 +1015,15 @@ void mg_glMultiDrawElements_indirect(GLenum mode, const GLsizei* count, GLenum t
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements(md_backend_t::Indirect, mode, count, type, indices, primcount);
+         return;
+     }
+ 
+     for (GLsizei i = 0; i < primcount; ++i) {
+         if (count[i] <= 0) continue;
+-        const GLvoid* offset = reinterpret_cast<GLvoid*>(i * sizeof(draw_elements_indirect_command_t));
++        const GLvoid* offset = reinterpret_cast<GLvoid*>(cmdOffset + i * sizeof(draw_elements_indirect_command_t));
+         GLES.glDrawElementsIndirect(mode, type, offset);
+     }
+ 
+@@ -968,6 +1038,7 @@ void mg_glMultiDrawElements_indirect(GLenum mode, const GLsizei* count, GLenum t
+ void mg_glMultiDrawElementsBaseVertex_multiindirect(GLenum mode, GLsizei* counts, GLenum type,
+                                                     const void* const* indices, GLsizei primcount,
+                                                     const GLint* basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(counts, type, primcount, indices)) return;
+ 
+@@ -987,12 +1058,13 @@ void mg_glMultiDrawElementsBaseVertex_multiindirect(GLenum mode, GLsizei* counts
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements_bv(md_backend_t::MultiIndirect, mode, counts, type, indices, primcount, basevertex);
+         return;
+     }
+ 
+-    GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
++    GLES.glMultiDrawElementsIndirectEXT(mode, type, reinterpret_cast<const void*>(cmdOffset), primcount, 0);
+ 
+     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
+ 
+@@ -1001,6 +1073,7 @@ void mg_glMultiDrawElementsBaseVertex_multiindirect(GLenum mode, GLsizei* counts
+ 
+ void mg_glMultiDrawElements_multiindirect(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                           GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(count, type, primcount, indices)) return;
+ 
+@@ -1016,12 +1089,13 @@ void mg_glMultiDrawElements_multiindirect(GLenum mode, const GLsizei* count, GLe
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements(md_backend_t::MultiIndirect, mode, count, type, indices, primcount);
+         return;
+     }
+ 
+-    GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
++    GLES.glMultiDrawElementsIndirectEXT(mode, type, reinterpret_cast<const void*>(cmdOffset), primcount, 0);
+ 
+     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
+ 
+@@ -1034,6 +1108,7 @@ void mg_glMultiDrawElements_multiindirect(GLenum mode, const GLsizei* count, GLe
+ 
+ void mg_glMultiDrawElementsBaseVertex_basevertex(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+                                                  GLsizei primcount, const GLint* basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(counts, type, primcount, indices)) return;
+ 
+@@ -1062,6 +1137,7 @@ void mg_glMultiDrawElementsBaseVertex_basevertex(GLenum mode, GLsizei* counts, G
+ 
+ void mg_glMultiDrawElements_basevertex(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                        GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(count, type, primcount, indices)) return;
+ 
+@@ -1134,6 +1210,7 @@ static bool mg_multi_draw_basevertex(GLenum mode, const GLsizei* counts, GLenum
+ 
+ void mg_glMultiDrawElementsBaseVertex_multibasevertex(GLenum mode, GLsizei* counts, GLenum type, const void* const* indices,
+                                              GLsizei primcount, const GLint* basevertex) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     // The latch read just below is per-context, so re-arm it first.
+     multidraw_check_context();
+@@ -1174,6 +1251,7 @@ void mg_glMultiDrawElementsBaseVertex_multibasevertex(GLenum mode, GLsizei* coun
+ 
+ void mg_glMultiDrawElements_multiarrays(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                       GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     multidraw_check_context();
+ 
+@@ -1210,6 +1288,7 @@ void mg_glMultiDrawElements_multiarrays(GLenum mode, const GLsizei* count, GLenu
+ 
+ void mg_glMultiDrawElements_multibasevertex(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                    GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     // The latch read just below is per-context, so re-arm it first.
+     multidraw_check_context();
+@@ -1674,6 +1753,7 @@ GLAPI GLAPIENTRY void mg_glMultiDrawElementsBaseVertex_compute(GLenum mode, GLsi
+ 
+ void mg_glMultiDrawElements_compute(GLenum mode, const GLsizei* count, GLenum type, const void* const* indices,
+                                     GLsizei primcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_multidraw_enter(count, type, primcount, indices)) return;
+ 
+@@ -1730,6 +1810,7 @@ static bool mg_validate_multidraw_arrays(const GLint* first, const GLsizei* coun
+ }
+ 
+ void mg_glMultiDrawArrays_unroll(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (!mg_validate_multidraw_arrays(first, count, drawcount)) return;
+ 
+@@ -1741,6 +1822,7 @@ void mg_glMultiDrawArrays_unroll(GLenum mode, const GLint* first, const GLsizei*
+ }
+ 
+ void mg_glMultiDrawArrays_multiarrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     // The latch below is per-context, so it has to be re-armed before it is read.
+     multidraw_check_context();
+@@ -1835,6 +1917,7 @@ static bool prepare_arrays_indirect_buffer(const GLint* first, const GLsizei* co
+ }
+ 
+ void mg_glMultiDrawArrays_multiindirect(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     multidraw_check_context();
+ 
+@@ -1907,6 +1990,7 @@ void mg_glMultiDrawArrays_multiindirect(GLenum mode, const GLint* first, const G
+ typedef void (*glMultiDrawArrays_t)(GLenum, const GLint*, const GLsizei*, GLsizei);
+ 
+ void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     static glMultiDrawArrays_t func_ptr = nullptr;
+ 
+     if (func_ptr == nullptr) {
+@@ -1927,6 +2011,7 @@ void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GL
+ }
+ 
+ void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (drawcount <= 0) return;
+     if (stride < 0) {
+@@ -1961,6 +2046,7 @@ void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawco
+ 
+ void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount,
+                                  GLsizei stride) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     if (drawcount <= 0) return;
+     if (stride < 0) {
+@@ -2268,12 +2354,14 @@ static bool mg_indirect_count(GLenum mode, GLenum type, bool is_elements, const
+ 
+ void glMultiDrawArraysIndirectCount(GLenum mode, const void* indirect, GLintptr drawcount, GLsizei maxdrawcount,
+                                     GLsizei stride) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     mg_indirect_count(mode, 0, false, indirect, drawcount, maxdrawcount, stride);
+ }
+ 
+ void glMultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void* indirect, GLintptr drawcount,
+                                       GLsizei maxdrawcount, GLsizei stride) {
++    mg_ft_scope_t mg_ft(MG_FT_MULTIDRAW);
+     LOG()
+     // Same as glMultiDrawElementsIndirect: indexed, so restart applies, but the
+     // stream is not reachable for rewriting.
 diff --git a/MobileGlues-cpp/gl/program.cpp b/MobileGlues-cpp/gl/program.cpp
 index 4c3a9d2..0e28cf3 100644
 --- a/MobileGlues-cpp/gl/program.cpp
@@ -495,3 +1036,30 @@ index f4dd2f7..08d060a 100644
  
      LOG_D("glTexSubImage2D, target = %s, level = %d, xoffset = %d, yoffset = %d, "
            "width = %d, height = %d, format = %s, type = %s, pixels = 0x%x",
+diff --git a/MobileGlues-cpp/gles/loader.h b/MobileGlues-cpp/gles/loader.h
+index dd503cc..4aa4b37 100644
+--- a/MobileGlues-cpp/gles/loader.h
++++ b/MobileGlues-cpp/gles/loader.h
+@@ -15,6 +15,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <type_traits>
++#include "../gl/frametime.h"
+ 
+ // The value a stub hands back when it has nothing to say. Defined out here rather
+ // than inside the extern "C" block below because a template cannot have C language
+@@ -135,9 +136,12 @@ extern "C"
+ #ifndef __APPLE__
+ #define NATIVE_FUNCTION_HEAD(type, name, ...)                                                                          \
+     extern "C" GLAPI GLAPIENTRY type name##ARB(__VA_ARGS__) __attribute__((alias(#name)));                             \
+-    extern "C" GLAPI GLAPIENTRY type name(__VA_ARGS__) {
++    extern "C" GLAPI GLAPIENTRY type name(__VA_ARGS__) {                                                               \
++        mg_ft_native_scope_t mg_ft_native;
+ #else
+-#define NATIVE_FUNCTION_HEAD(type, name, ...) extern "C" GLAPI GLAPIENTRY type name(__VA_ARGS__) {
++#define NATIVE_FUNCTION_HEAD(type, name, ...)                                                                          \
++    extern "C" GLAPI GLAPIENTRY type name(__VA_ARGS__) {                                                               \
++        mg_ft_native_scope_t mg_ft_native;
+ #endif
+ 
+ #if GLOBAL_DEBUG
