@@ -1,0 +1,32 @@
+name: Build Spike Catcher
+
+on:
+  push:
+    paths:
+      - "spike-catcher/**"
+      - ".github/workflows/build-spike-catcher.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: spike-catcher
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "21"
+
+      - name: Build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-catcher-${{ github.sha }}
+          path: spike-catcher/build/libs/spike-catcher-*.jar

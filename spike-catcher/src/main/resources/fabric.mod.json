@@ -1,0 +1,19 @@
+{
+	"schemaVersion": 1,
+	"id": "spike_catcher",
+	"version": "${version}",
+	"name": "Spike Catcher",
+	"description": "Writes down what the game is doing during any frame that takes longer than 50 ms.",
+	"authors": ["loaffie"],
+	"license": "All-Rights-Reserved",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.loaffie.spikecatcher.SpikeCatcher"]
+	},
+	"mixins": ["spike_catcher.mixins.json"],
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"minecraft": "1.21.11",
+		"java": ">=21"
+	}
+}
