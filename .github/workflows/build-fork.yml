@@ -42,6 +42,14 @@ jobs:
             git apply --verbose "$p"
           done
 
+      - name: Apply app patches
+        working-directory: plugin
+        run: |
+          for p in "$GITHUB_WORKSPACE"/fork-repo/fork/app-patches/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
+
       - name: Make it installable next to the official plugin
         working-directory: plugin
         run: |

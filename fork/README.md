@@ -42,6 +42,20 @@ Both can be changed in `/sdcard/MG/config.json`:
 | `"hitchLog": 1` | Times only the calls most likely to stall. Cheap. |
 | `"hitchLog": 0` | Turns the hitch log and summary off. |
 
+## App changes
+
+`app-patches/0001-dot-matrix-theme-and-tuning-features.patch` changes the plugin app itself (Material style only):
+
+- Monochrome theme with one red accent, dot-matrix headings and numbers, a faint dot grid behind pages,
+  and a matching launcher icon. The font is Doto (SIL Open Font License, shipped in
+  `assets/licenses/Doto-OFL.txt`).
+- **Settings → Tuning**: one-tap presets (PvP, Cooler, Diagnose), CPU boost target, frame-time logging
+  level, the last-session report and a button to share `latest.log`.
+- **Last session report**: typical FPS, worst frame and hitches per second, an FPS chart per 30 s, and
+  where the frame time went, all read from `latest.log`.
+
+The renderer's default logging level is now Light (`hitchLog` 1), which is enough for the report.
+
 ## Getting the APK
 
 Every push that touches `fork/` runs the "Build patched MobileGlues plugin" workflow. Open the run under the

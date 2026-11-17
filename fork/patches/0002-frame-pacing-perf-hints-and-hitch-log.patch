@@ -184,7 +184,7 @@ index d3c9619..1c5f116 100644
            count, basevertex, baseinstance)
 diff --git a/MobileGlues-cpp/gl/frametime.cpp b/MobileGlues-cpp/gl/frametime.cpp
 new file mode 100644
-index 0000000..851c987
+index 0000000..b5c6420
 --- /dev/null
 +++ b/MobileGlues-cpp/gl/frametime.cpp
 @@ -0,0 +1,267 @@
@@ -226,7 +226,7 @@ index 0000000..851c987
 +//   "perfHintTargetFps": N   frame rate the CPU hints aim for (default 120),
 +//                            0 turns the hints off
 +int g_cfg_read = 0;
-+int g_cfg_hitch_log = 2; // diagnostic build: full timing unless config says otherwise
++int g_cfg_hitch_log = 1; // light timing unless config.json says otherwise (the app exposes it)
 +int g_cfg_target_fps = 120;
 +
 +void read_config_once() {
