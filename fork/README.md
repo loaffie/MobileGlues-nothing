@@ -42,6 +42,14 @@ Both can be changed in `/sdcard/MG/config.json`:
 | `"hitchLog": 1` | Times only the calls most likely to stall. Cheap. |
 | `"hitchLog": 0` | Turns the hitch log and summary off. |
 
+`patches/0003-render-thread-core-placement.patch` (`gl/frametime.cpp`)
+
+- **Render thread cores** (`"pinRenderThread"`, off by default). In Minecraft the thread that presents frames
+  also runs the game logic, about 80% of each frame on the Phone (3a). 1 keeps it off the slowest cluster
+  (on the Snapdragon 7s Gen 3: the four A720 cores), 2 keeps it on the fastest core only. The masks come from
+  each core's maximum clock, not from core numbers. Measurements elsewhere found this helps on some SoCs and
+  hurts on others, so it is a switch to A/B; the log says which CPUs were used.
+
 ## App changes
 
 `app-patches/0001-dot-matrix-theme-and-tuning-features.patch` changes the plugin app itself (Material style only):
@@ -49,8 +57,8 @@ Both can be changed in `/sdcard/MG/config.json`:
 - Monochrome theme with one red accent, dot-matrix headings and numbers, a faint dot grid behind pages,
   and a matching launcher icon. The font is Doto (SIL Open Font License, shipped in
   `assets/licenses/Doto-OFL.txt`).
-- **Settings → Tuning**: one-tap presets (PvP, Cooler, Diagnose), CPU boost target, frame-time logging
-  level, the last-session report and a button to share `latest.log`.
+- **Settings → Tuning**: one-tap presets (PvP, Cooler, Diagnose), CPU boost target, render thread cores,
+  frame-time logging level, the last-session report and a button to share `latest.log`.
 - **Last session report**: typical FPS, worst frame and hitches per second, an FPS chart per 30 s, and
   where the frame time went, all read from `latest.log`.
 

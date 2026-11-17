@@ -1,0 +1,134 @@
+diff --git a/MobileGlues-cpp/gl/frametime.cpp b/MobileGlues-cpp/gl/frametime.cpp
+index b5c6420..9cc3e5e 100644
+--- a/MobileGlues-cpp/gl/frametime.cpp
++++ b/MobileGlues-cpp/gl/frametime.cpp
+@@ -10,10 +10,14 @@
+ #include "log.h"
+ #include "mg.h"
+ 
++#include <cerrno>
+ #include <cstdio>
++#include <cstring>
++#include <string>
+ 
+ #ifdef __ANDROID__
+ #include <dlfcn.h>
++#include <sched.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ #endif
+@@ -35,7 +39,11 @@ namespace {
+ //   "hitchLog": 2            also time every forwarded GL call; costs frame rate
+ //   "perfHintTargetFps": N   frame rate the CPU hints aim for (default 120),
+ //                            0 turns the hints off
++//   "pinRenderThread": 0     leave core placement to Android (default)
++//   "pinRenderThread": 1     keep the render thread off the slowest cluster ("big")
++//   "pinRenderThread": 2     keep it on the fastest cores only ("prime")
+ int g_cfg_read = 0;
++int g_cfg_pin = 0;
+ int g_cfg_hitch_log = 1; // light timing unless config.json says otherwise (the app exposes it)
+ int g_cfg_target_fps = 120;
+ 
+@@ -50,12 +58,94 @@ void read_config_once() {
+     } else if (fps > 0) {
+         g_cfg_target_fps = fps < 20 ? 20 : (fps > 240 ? 240 : fps);
+     }
++    const int pin = config_get_int(const_cast<char*>("pinRenderThread"));
++    if (pin >= 0 && pin <= 2) g_cfg_pin = pin;
+     g_mg_ft_enabled = g_cfg_hitch_log != 0;
+     g_mg_ft_all = g_cfg_hitch_log >= 2;
+     LOG_V("[MobileGlues] Setting: hitchLog                    = %d", g_cfg_hitch_log)
+     LOG_V("[MobileGlues] Setting: perfHintTargetFps           = %d", g_cfg_target_fps)
++    LOG_V("[MobileGlues] Setting: pinRenderThread             = %d", g_cfg_pin)
+ }
+ 
++// ---------------------------------------------------------------------------
++// Render thread placement
++//
++// In Minecraft the thread that presents frames is the game's main thread: it
++// runs the game logic and issues every GL call. Measured on the Phone (3a) that
++// thread is about 80% of each frame outside this library, so where it runs
++// matters more than anything the renderer does.
++//
++// Android's guidance is to leave placement to the scheduler and send ADPF hints,
++// which this file also does. Elsewhere, scheduler and hints together have been
++// measured to leave a game's busiest thread on mid or little cores while the
++// fastest core idled. Asking for the fast cores explicitly fixed that on one
++// SoC and made things worse on another whose prime cores were clock-capped, so
++// this is a switch to A/B, off by default.
++//
++// The masks come from each core's cpuinfo_max_freq rather than from core
++// numbers, which differ per SoC. On the Snapdragon 7s Gen 3 (4x A520 1.8 GHz,
++// 3x A720 2.4 GHz, 1x A720 2.5 GHz) "big" is the four A720s and "prime" the one.
++// ---------------------------------------------------------------------------
++#ifdef __ANDROID__
++long read_cpu_max_khz(int cpu) {
++    char path[96];
++    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
++    FILE* f = std::fopen(path, "r");
++    if (!f) return -1;
++    long khz = -1;
++    if (std::fscanf(f, "%ld", &khz) != 1) khz = -1;
++    std::fclose(f);
++    return khz;
++}
++
++thread_local bool t_pin_tried = false;
++
++void pin_render_thread_once() {
++    if (g_cfg_pin == 0 || t_pin_tried) return;
++    t_pin_tried = true;
++
++    const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
++    if (ncpu <= 0 || ncpu > CPU_SETSIZE) return;
++    long maxes[CPU_SETSIZE];
++    long lo = -1, hi = -1;
++    for (int c = 0; c < ncpu; ++c) {
++        maxes[c] = read_cpu_max_khz(c);
++        if (maxes[c] <= 0) continue;
++        if (lo < 0 || maxes[c] < lo) lo = maxes[c];
++        if (hi < 0 || maxes[c] > hi) hi = maxes[c];
++    }
++    if (hi <= 0) {
++        LOG_V("[MobileGlues] render thread: core speeds unreadable, placement left to Android")
++        return;
++    }
++
++    cpu_set_t set;
++    CPU_ZERO(&set);
++    std::string chosen;
++    int count = 0;
++    for (int c = 0; c < ncpu; ++c) {
++        if (maxes[c] <= 0) continue;
++        // big: everything faster than the slowest cluster. On a SoC with a
++        // single speed that is nothing, so fall back to every core.
++        const bool take = (g_cfg_pin == 2) ? (maxes[c] == hi) : (maxes[c] > lo || lo == hi);
++        if (!take) continue;
++        CPU_SET(c, &set);
++        chosen += " " + std::to_string(c);
++        ++count;
++    }
++    if (count == 0) return;
++
++    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
++        LOG_V("[MobileGlues] render thread: pinning to CPUs%s refused (%s)", chosen.c_str(), std::strerror(errno))
++        return;
++    }
++    LOG_V("[MobileGlues] render thread pinned to CPUs%s (%s, up to %ld MHz)", chosen.c_str(),
++          g_cfg_pin == 2 ? "prime" : "big", hi / 1000)
++}
++#else
++void pin_render_thread_once() {}
++#endif
++
+ // ---------------------------------------------------------------------------
+ // Performance hints (Android Dynamic Performance Framework, API 33+)
+ //
+@@ -163,6 +253,7 @@ double ms(uint64_t ns) {
+ 
+ void mg_frame_presented() {
+     read_config_once();
++    pin_render_thread_once();
+ 
+     pacing_state_t& p = t_pacing;
+     mg_ft_frame_t frame = g_mg_ft_frame;

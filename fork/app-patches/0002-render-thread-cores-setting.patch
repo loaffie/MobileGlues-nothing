@@ -1,0 +1,264 @@
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt b/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt
+index 44b23a7..f806adc 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt
+@@ -36,6 +36,10 @@ object FrameTimeLog {
+         val perfHints: String?,
+         val hitchLogLevel: Int?,
+         val windows: List<Window>,
++        /** Cores the render thread was pinned to, e.g. "4 5 6 7"; null when not pinned. */
++        val pinnedCpus: String? = null,
++        /** True when pinning was asked for and the system refused it. */
++        val pinRefused: Boolean = false,
+     ) {
+         /**
+          * Windows that describe actual play. The first one includes loading into the world
+@@ -76,6 +80,8 @@ object FrameTimeLog {
+     private val drawPathLine = Regex("""multidrawOrderElementsBaseVertex\s+= ([a-z]+)""")
+     private val hitchLogLine = Regex("""Setting: hitchLog\s+= (\d+)""")
+     private val perfHintLine = Regex("""perf hints: (.*)$""")
++    private val pinnedLine = Regex("""render thread pinned to CPUs ([\d ]+)""")
++    private val pinRefusedLine = Regex("""render thread: pinning to CPUs[\d ]+ refused""")
+ 
+     fun parse(text: String?): Report? {
+         if (text.isNullOrBlank()) return null
+@@ -83,6 +89,8 @@ object FrameTimeLog {
+         var drawPath: String? = null
+         var perfHints: String? = null
+         var hitchLog: Int? = null
++        var pinned: String? = null
++        var pinRefused = false
+         val windows = mutableListOf<Window>()
+ 
+         for (line in text.lineSequence()) {
+@@ -114,9 +122,11 @@ object FrameTimeLog {
+             if (drawPath == null) drawPathLine.find(line)?.let { drawPath = it.groupValues[1] }
+             if (hitchLog == null) hitchLogLine.find(line)?.let { hitchLog = it.groupValues[1].toIntOrNull() }
+             if (perfHints == null) perfHintLine.find(line)?.let { perfHints = it.groupValues[1].trim() }
++            if (pinned == null) pinnedLine.find(line)?.let { pinned = it.groupValues[1].trim() }
++            if (pinRefusedLine.containsMatchIn(line)) pinRefused = true
+         }
+ 
+         if (windows.isEmpty() && angle == null && drawPath == null) return null
+-        return Report(angle, drawPath, perfHints, hitchLog, windows)
++        return Report(angle, drawPath, perfHints, hitchLog, windows, pinned, pinRefused)
+     }
+ }
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt
+index be87052..f079c12 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt
+@@ -367,6 +367,21 @@ enum class HitchLogLevel(override val wire: Int, @param:StringRes private val la
+     override fun label(context: Context): CharSequence = context.getString(labelRes)
+ }
+ 
++/**
++ * `pinRenderThread` (MobileGlues Nothing): which CPU cores the render thread may run on.
++ *
++ * Must match gl/frametime.cpp: 0 leaves it to Android, 1 keeps it off the slowest cluster,
++ * 2 keeps it on the fastest cores only.
++ */
++enum class RenderThreadPin(override val wire: Int, @param:StringRes private val labelRes: Int) :
++    SpinnerOption {
++    Auto(0, R.string.nt_pin_auto),
++    Big(1, R.string.nt_pin_big),
++    Prime(2, R.string.nt_pin_prime);
++
++    override fun label(context: Context): CharSequence = context.getString(labelRes)
++}
++
+ /**
+  * `perfHintTargetFps` (MobileGlues Nothing): the frame rate the CPU performance hints aim for.
+  *
+@@ -407,6 +422,7 @@ data class MGConfig(
+     val fsr1: Fsr1Preset = Fsr1Preset.Disabled,
+     val hitchLog: HitchLogLevel = HitchLogLevel.Light,
+     val perfHintFps: Int = PerfHintTarget.DEFAULT,
++    val pinRenderThread: RenderThreadPin = RenderThreadPin.Auto,
+ ) {
+     val fsr1Enabled: Boolean get() = fsr1 != Fsr1Preset.Disabled
+ 
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt
+index 6f1d2a2..484c8f0 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt
+@@ -36,6 +36,7 @@ internal object MGConfigCodec {
+     private const val KEY_FSR1 = "fsr1Setting"
+     private const val KEY_HITCH_LOG = "hitchLog"
+     private const val KEY_PERF_HINT_FPS = "perfHintTargetFps"
++    private const val KEY_PIN_RENDER_THREAD = "pinRenderThread"
+ 
+     private val KNOWN_KEYS = listOf(
+         KEY_ANGLE,
+@@ -52,6 +53,7 @@ internal object MGConfigCodec {
+         KEY_FSR1,
+         KEY_HITCH_LOG,
+         KEY_PERF_HINT_FPS,
++        KEY_PIN_RENDER_THREAD,
+     ) + MultidrawEntry.entries.flatMap { listOf(it.orderKey, it.legacyModeKey) }
+ 
+     fun decode(root: JsonObject): MGConfig {
+@@ -76,6 +78,8 @@ internal object MGConfigCodec {
+             // Missing key = the renderer's own default (light timing, 120 fps hints).
+             hitchLog = HitchLogLevel.entries.fromWire(root.intOrNull(KEY_HITCH_LOG), defaults.hitchLog),
+             perfHintFps = PerfHintTarget.fromWire(root.intOrNull(KEY_PERF_HINT_FPS)),
++            pinRenderThread = RenderThreadPin.entries
++                .fromWire(root.intOrNull(KEY_PIN_RENDER_THREAD), defaults.pinRenderThread),
+         )
+     }
+ 
+@@ -92,6 +96,7 @@ internal object MGConfigCodec {
+             addProperty(KEY_FSR1, config.fsr1.wire)
+             addProperty(KEY_HITCH_LOG, config.hitchLog.wire)
+             addProperty(KEY_PERF_HINT_FPS, config.perfHintFps)
++            addProperty(KEY_PIN_RENDER_THREAD, config.pinRenderThread.wire)
+             encodeMultidraw(config.multidraw)
+         }
+ 
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt b/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt
+index b6adcf0..9c5a277 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt
+@@ -13,6 +13,7 @@ import com.fcl.plugin.mobileglues.settings.HitchLogLevel
+ import com.fcl.plugin.mobileglues.settings.MGConfig
+ import com.fcl.plugin.mobileglues.settings.MGConfigStore
+ import com.fcl.plugin.mobileglues.settings.PerfHintTarget
++import com.fcl.plugin.mobileglues.settings.RenderThreadPin
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.MutableStateFlow
+@@ -40,6 +41,8 @@ class NothingFeatures(
+ 
+     fun setHitchLog(level: HitchLogLevel) = configStore.update { it.copy(hitchLog = level) }
+ 
++    fun setRenderThreadPin(pin: RenderThreadPin) = configStore.update { it.copy(pinRenderThread = pin) }
++
+     fun setPerfHintFps(fps: Int) = configStore.update { it.copy(perfHintFps = PerfHintTarget.fromWire(fps)) }
+ 
+     // ---- Presets ----
+@@ -47,7 +50,7 @@ class NothingFeatures(
+     enum class Preset(
+         @param:StringRes val labelRes: Int,
+         @param:StringRes val summaryRes: Int,
+-        val apply: (MGConfig) -> MGConfig,
++        val transform: (MGConfig) -> MGConfig,
+     ) {
+         /** What the measurements on the Phone (3a) favoured: ANGLE, 120 fps hints, no timing. */
+         PvP(R.string.nt_preset_pvp, R.string.nt_preset_pvp_summary, {
+@@ -78,12 +81,12 @@ class NothingFeatures(
+     }
+ 
+     fun applyPreset(preset: Preset) {
+-        configStore.update(preset.apply)
++        configStore.update(preset.transform)
+         snackbar(context.getString(R.string.nt_preset_applied, context.getString(preset.labelRes)))
+     }
+ 
+     /** The preset the current config matches exactly, if any. */
+-    fun matchingPreset(config: MGConfig): Preset? = Preset.entries.firstOrNull { it.apply(config) == config }
++    fun matchingPreset(config: MGConfig): Preset? = Preset.entries.firstOrNull { it.transform(config) == config }
+ 
+     // ---- Frame-time report ----
+ 
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt
+index 01e3d12..d70c085 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt
+@@ -128,6 +128,15 @@ private fun ReportContent(controller: AppController, report: FrameTimeLog.Report
+         }
+         report.chunkDrawPath?.let { StatusChip(it, true) }
+     }
++    if (report.pinnedCpus != null || report.pinRefused) {
++        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = ScreenPadding)) {
++            if (report.pinnedCpus != null) {
++                StatusChip(stringResource(R.string.nt_chip_pinned, report.pinnedCpus), true)
++            } else {
++                StatusChip(stringResource(R.string.nt_chip_pin_refused), false)
++            }
++        }
++    }
+ 
+     if (report.windows.isEmpty()) {
+         EmptyNote(stringResource(R.string.nt_report_logging_off))
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt
+index f08876a..cae4ba1 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt
+@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.FlowRow
+ import androidx.compose.material3.OutlinedButton
+ import com.fcl.plugin.mobileglues.settings.HitchLogLevel
+ import com.fcl.plugin.mobileglues.settings.PerfHintTarget
++import com.fcl.plugin.mobileglues.settings.RenderThreadPin
+ import com.fcl.plugin.mobileglues.ui.AppSubPage
+ import com.fcl.plugin.mobileglues.ui.NothingFeatures
+ import androidx.compose.foundation.layout.Column
+@@ -146,6 +147,7 @@ private fun ConfigSections(controller: AppController, config: MGConfig) {
+             config = config,
+             onPickBoost = { choice = ChoiceTarget.PerfHint },
+             onPickLogging = { choice = ChoiceTarget.HitchLog },
++            onPickPin = { choice = ChoiceTarget.Pin },
+         )
+ 
+         PreferenceGroup(title = stringResource(R.string.settings_group_render)) {
+@@ -275,6 +277,14 @@ private fun ConfigSections(controller: AppController, config: MGConfig) {
+             )
+         }
+ 
++        ChoiceTarget.Pin -> OptionDialog(
++            title = stringResource(R.string.nt_pin_title),
++            options = RenderThreadPin.entries,
++            selected = config.pinRenderThread,
++            onSelect = controller.nothing::setRenderThreadPin,
++            onDismiss = { choice = null },
++        )
++
+         ChoiceTarget.HitchLog -> OptionDialog(
+             title = stringResource(R.string.nt_logging_title),
+             options = HitchLogLevel.entries,
+@@ -339,7 +349,7 @@ private fun <T : SpinnerOption> OptionDialog(
+     )
+ }
+ 
+-private enum class ChoiceTarget { Angle, NoError, DepthClear, GlVersion, PerfHint, HitchLog }
++private enum class ChoiceTarget { Angle, NoError, DepthClear, GlVersion, PerfHint, HitchLog, Pin }
+ 
+ /**
+  * MobileGlues Nothing: presets, the two settings the patched renderer reads, and the way to the
+@@ -351,6 +361,7 @@ private fun NtTuningGroup(
+     config: MGConfig,
+     onPickBoost: () -> Unit,
+     onPickLogging: () -> Unit,
++    onPickPin: () -> Unit,
+ ) {
+     val context = LocalContext.current
+     val matching = controller.nothing.matchingPreset(config)
+@@ -389,6 +400,11 @@ private fun NtTuningGroup(
+                 stringResource(R.string.nt_boost_hint),
+             onClick = onPickBoost,
+         )
++        TextPreferenceRow(
++            title = stringResource(R.string.nt_pin_title),
++            summary = config.pinRenderThread.label(context).toString(),
++            onClick = onPickPin,
++        )
+         TextPreferenceRow(
+             title = stringResource(R.string.nt_logging_title),
+             summary = config.hitchLog.label(context).toString(),
+diff --git a/app/src/main/res/values/strings_nothing.xml b/app/src/main/res/values/strings_nothing.xml
+index 6a827fc..f9ccdb6 100644
+--- a/app/src/main/res/values/strings_nothing.xml
++++ b/app/src/main/res/values/strings_nothing.xml
+@@ -20,6 +20,13 @@
+     <string name="nt_boost_off">Off</string>
+     <string name="nt_boost_fps">%1$d fps</string>
+ 
++    <string name="nt_pin_title">Render thread cores</string>
++    <string name="nt_pin_auto">Let Android decide (default)</string>
++    <string name="nt_pin_big">Big cores only (skip the slow cores)</string>
++    <string name="nt_pin_prime">Fastest core only</string>
++    <string name="nt_chip_pinned">Render thread on CPUs %1$s</string>
++    <string name="nt_chip_pin_refused">Core pinning refused</string>
++
+     <string name="nt_logging_title">Frame-time logging</string>
+     <string name="nt_hitch_off">Off</string>
+     <string name="nt_hitch_light">Light (cheap, enough for the report)</string>
