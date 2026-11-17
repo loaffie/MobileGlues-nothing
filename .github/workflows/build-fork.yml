@@ -57,14 +57,16 @@ jobs:
           distribution: zulu
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android NDK
         working-directory: plugin
         run: |
-          echo "y" | sdkmanager "ndk;27.3.13750724"
-          echo "ndk.dir=$ANDROID_HOME/ndk/27.3.13750724" >> local.properties
+          # The runner image ships the Android SDK; only the NDK version is missing.
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager | tail -1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;27.3.13750724"
+          echo "sdk.dir=$SDK" >> local.properties
+          echo "ndk.dir=$SDK/ndk/27.3.13750724" >> local.properties
 
       - name: Build APK
         working-directory: plugin
