@@ -1,0 +1,85 @@
+name: Build patched MobileGlues plugin
+
+# Builds the upstream MobileGlues plugin APK with the patches in fork/patches
+# applied to the renderer. See fork/README.md.
+
+on:
+  push:
+    paths:
+      - "fork/**"
+      - ".github/workflows/build-fork.yml"
+  workflow_dispatch:
+
+env:
+  PLUGIN_REF: f5105e4
+  MOBILEGLUES_REF: 97558a69157b033b890958b1e49258c5b51a80c6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: fork-repo
+
+      - name: Fetch upstream plugin and renderer
+        run: |
+          git clone https://github.com/MobileGL-Dev/MobileGlues-plugin.git plugin
+          cd plugin
+          git checkout "$PLUGIN_REF"
+          git submodule update --init
+          cd MobileGlues
+          git fetch origin "$MOBILEGLUES_REF"
+          git checkout "$MOBILEGLUES_REF"
+          git submodule update --init --recursive --depth=1
+
+      - name: Apply patches
+        working-directory: plugin/MobileGlues
+        run: |
+          for p in "$GITHUB_WORKSPACE"/fork-repo/fork/patches/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
+
+      - name: Make it installable next to the official plugin
+        working-directory: plugin
+        run: |
+          cp "$GITHUB_WORKSPACE/fork-repo/fork/test-signing.jks" keystore.jks
+          sed -i 's|applicationId = "com.fcl.plugin.mobileglues"|applicationId = "com.fcl.plugin.mobileglues.nothing"|' app/build.gradle.kts
+          sed -i 's|resValue("string","app_name","MobileGlues")|resValue("string","app_name","MobileGlues Nothing")|' app/build.gradle.kts
+          sed -i 's|"MobileGlues (OpenGL 4.0, 1.17+)"|"MobileGlues Nothing (OpenGL 4.0, 1.17+)"|' app/build.gradle.kts
+          grep -n 'mobileglues.nothing\|MobileGlues Nothing' app/build.gradle.kts
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        working-directory: plugin
+        run: |
+          echo "y" | sdkmanager "ndk;27.3.13750724"
+          echo "ndk.dir=$ANDROID_HOME/ndk/27.3.13750724" >> local.properties
+
+      - name: Build APK
+        working-directory: plugin
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease
+        env:
+          # A throwaway key that only exists so every build has the same
+          # signature and installs over the previous one. It protects nothing.
+          SIGNING_STORE_PASSWORD: nothing-test
+          SIGNING_KEY_ALIAS: nothing
+          SIGNING_KEY_PASSWORD: nothing-test
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileGlues-Nothing-${{ github.sha }}
+          path: plugin/app/build/outputs/apk/release/*.apk

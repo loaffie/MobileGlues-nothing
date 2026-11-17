@@ -1,0 +1,239 @@
+diff --git a/MobileGlues-cpp/gl/multidraw.cpp b/MobileGlues-cpp/gl/multidraw.cpp
+index b925887..5a02c6e 100644
+--- a/MobileGlues-cpp/gl/multidraw.cpp
++++ b/MobileGlues-cpp/gl/multidraw.cpp
+@@ -280,6 +280,14 @@ enum class md_probe_state_t { Unprobed, Working, Failed };
+ static bool g_indirect_cmds_inited = false;
+ static GLsizei g_cmdbufsize = 0;
+ static GLuint g_indirectbuffer = 0;
++// Next free command slot in g_indirectbuffer. The buffer is a stream: every
++// multi-draw appends its commands after the previous call's instead of
++// overwriting slot 0, so the driver is never asked to rewrite bytes a queued
++// draw still has to read. See prepare_indirect_buffer.
++static GLsizei g_cmdbufhead = 0;
++// Smallest store the stream is given. 32768 commands is 640 KiB, enough for the
++// several dozen multi-draws a frame of chunk rendering issues before it wraps.
++static const GLsizei MG_CMD_STREAM_MIN = 32768;
+ 
+ // Arrays commands are 16 bytes, element commands 20, and the capacity counters
+ // below are in commands, not bytes. Sharing one buffer between the two layouts
+@@ -342,6 +350,7 @@ static void multidraw_check_context() {
+     // objects belonging to whichever context *is* current.
+     g_indirect_cmds_inited = false;
+     g_cmdbufsize = 0;
++    g_cmdbufhead = 0;
+     g_indirectbuffer = 0;
+     g_arrays_indirectbuffer = 0;
+     g_arrays_cmdbufsize = 0;
+@@ -650,8 +659,11 @@ void glMultiDrawElementsBaseVertex(GLenum mode, GLsizei* counts, GLenum type, co
+ 
+ // Returns false when the command buffer could not be prepared; the caller must
+ // then fall back rather than issue a draw from an unwritten buffer.
++//
++// The commands are written at *out_offset bytes into the buffer, not at 0; the
++// caller has to hand that offset to the indirect draw.
+ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const void* const* indices, GLsizei primcount,
+-                                    const GLint* basevertex, GLuint* out_prev_binding) {
++                                    const GLint* basevertex, GLuint* out_prev_binding, size_t* out_offset) {
+     if (primcount <= 0) return false;
+ 
+     const GLsizei elementSize = mg_index_size(type);
+@@ -684,43 +696,65 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
+     }
+     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_indirectbuffer);
+ 
+-    if (g_cmdbufsize < primcount) {
+-        size_t sz = g_cmdbufsize > 0 ? static_cast<size_t>(g_cmdbufsize) : 1;
+-        while (sz < static_cast<size_t>(primcount))
++    // The store is a stream, not a single slot.
++    //
++    // Sodium issues one multi-draw per region per render pass, several dozen a
++    // frame, and each used to glBufferSubData its commands over offset 0 of the
++    // same buffer -- while the draws queued by the previous call still had to
++    // read those bytes. A tiled GPU does not execute a draw when it is issued, so
++    // the driver can only honour that by renaming the store (allocate, copy) or
++    // by flushing the pass and waiting for it, and it has to choose again on
++    // every call. Either shows up as frame time that scales with how many
++    // regions are visible, which is exactly what changes when the camera turns
++    // or new chunks arrive.
++    //
++    // Appending instead means no call ever touches a byte that a pending draw
++    // references. When the stream is full the store is orphaned -- a fresh
++    // glBufferData of the same size, which lets the driver detach the old
++    // memory without waiting for it -- and the stream starts over.
++    if (g_cmdbufsize < primcount || g_cmdbufhead > g_cmdbufsize - primcount) {
++        size_t sz = g_cmdbufsize > 0 ? static_cast<size_t>(g_cmdbufsize) : static_cast<size_t>(MG_CMD_STREAM_MIN);
++        // Room for a few calls of this size, so one unusually large batch does
++        // not turn every later call into an orphan.
++        while (sz < static_cast<size_t>(primcount) * 4)
+             sz *= 2;
++        const bool grew = sz != static_cast<size_t>(g_cmdbufsize);
+ 
+         const size_t wanted = sz * sizeof(draw_elements_indirect_command_t);
+-        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_DYNAMIC_DRAW);
++        GLES.glBufferData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLsizeiptr>(wanted), NULL, GL_STREAM_DRAW);
++        g_cmdbufhead = 0;
+ 
+         // Only record the new capacity once the store really grew. Assigning it
+         // unconditionally made an out-of-memory permanent: the tracked size then
+         // claimed more room than the buffer had, the resize branch was never
+         // taken again, and every later map ran past the end of the store.
+-        GLint real_size = 0;
+-        GLES.glGetBufferParameteriv(GL_DRAW_INDIRECT_BUFFER, GL_BUFFER_SIZE, &real_size);
+-        if (real_size < 0 || static_cast<size_t>(real_size) < wanted) {
+-            MD_WARN_ONCE("multidraw: indirect buffer allocation failed (wanted %zu bytes, got %d)", wanted, real_size);
+-            // The failed glBufferData leaves the store in an undefined state, so
+-            // the previously recorded capacity no longer describes it. Clearing it
+-            // forces a fresh allocation attempt next time; keeping the stale value
+-            // would skip the resize branch forever and make every later map fail.
+-            g_cmdbufsize = 0;
+-            GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
+-            return false;
++        //
++        // Asked only when the size changed. An orphan re-requests a size the
++        // driver has already granted, and this query is a round trip that would
++        // otherwise be paid on every wrap.
++        if (grew) {
++            GLint real_size = 0;
++            GLES.glGetBufferParameteriv(GL_DRAW_INDIRECT_BUFFER, GL_BUFFER_SIZE, &real_size);
++            if (real_size < 0 || static_cast<size_t>(real_size) < wanted) {
++                MD_WARN_ONCE("multidraw: indirect buffer allocation failed (wanted %zu bytes, got %d)", wanted,
++                             real_size);
++                // The failed glBufferData leaves the store in an undefined state, so
++                // the previously recorded capacity no longer describes it. Clearing it
++                // forces a fresh allocation attempt next time; keeping the stale value
++                // would skip the resize branch forever and make every later map fail.
++                g_cmdbufsize = 0;
++                GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prev);
++                return false;
++            }
++            g_cmdbufsize = static_cast<GLsizei>(sz);
+         }
+-        g_cmdbufsize = static_cast<GLsizei>(sz);
+-    }
+-
+-    // Built on the CPU and uploaded whole, rather than written through a
+-    // GL_MAP_INVALIDATE_BUFFER_BIT mapping. The mapping says "all of this is
+-    // about to be overwritten" more precisely, and on a driver that honours it
+-    // there is nothing to choose between the two. What it costs is two ways to
+-    // fail on every single draw call: a map that returns null, and an unmap that
+-    // reports the contents lost. Both used to abandon the backend for the rest of
+-    // the process, and falling back to unrolled draws forever is far more
+-    // expensive than the upload that was being avoided -- a driver refusing to
+-    // hand out a pointer for a buffer it is still reading is a perfectly ordinary
+-    // thing, not a reason to give up on indirect drawing.
++    }
++
++    // Built on the CPU first, then copied into the stream. A mapping can fail in
++    // two ways on any call -- a map that returns null, an unmap that reports the
++    // contents lost -- and both used to abandon the backend for the rest of the
++    // process. With the commands staged here neither is fatal: the same bytes go
++    // through glBufferSubData instead, for that one call only.
+     //
+     // thread_local for the same reason as mg_zero_basevertex: nothing in this
+     // file takes a lock, and two threads can each have a current context.
+@@ -749,8 +783,34 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
+         pcmds[i].reservedMustBeZero = 0;
+     }
+ 
+-    GLES.glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0,
+-                         static_cast<GLsizeiptr>(primcount * sizeof(draw_elements_indirect_command_t)), pcmds);
++    const size_t offset = static_cast<size_t>(g_cmdbufhead) * sizeof(draw_elements_indirect_command_t);
++    const size_t bytes = static_cast<size_t>(primcount) * sizeof(draw_elements_indirect_command_t);
++
++    // GL_MAP_UNSYNCHRONIZED_BIT is the point: it is a promise that nothing
++    // pending reads this range, which the append-only head guarantees, and it is
++    // what lets the driver hand the pointer out without waiting for the GPU or
++    // copying the store. glBufferSubData has no way to make that promise.
++    bool written = false;
++    if (GLES.glMapBufferRange && GLES.glUnmapBuffer) {
++        void* dst = GLES.glMapBufferRange(GL_DRAW_INDIRECT_BUFFER, static_cast<GLintptr>(offset),
++                                          static_cast<GLsizeiptr>(bytes),
++                                          GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++        if (dst) {
++            memcpy(dst, pcmds, bytes);
++            written = GLES.glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER) == GL_TRUE;
++        }
++        if (!written) {
++            MD_WARN_ONCE("multidraw: mapping the indirect command stream failed, uploading with glBufferSubData");
++            mg_md_drain(); // a refused map leaves an error behind
++        }
++    }
++    if (!written) {
++        GLES.glBufferSubData(GL_DRAW_INDIRECT_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes),
++                             pcmds);
++    }
++
++    g_cmdbufhead += primcount;
++    *out_offset = offset;
+     return true;
+ }
+ 
+@@ -913,14 +973,15 @@ void mg_glMultiDrawElementsBaseVertex_indirect(GLenum mode, GLsizei* counts, GLe
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements_bv(md_backend_t::Indirect, mode, counts, type, indices, primcount, basevertex);
+         return;
+     }
+ 
+     for (GLsizei i = 0; i < primcount; ++i) {
+         if (counts[i] <= 0) continue;
+-        const GLvoid* offset = reinterpret_cast<GLvoid*>(i * sizeof(draw_elements_indirect_command_t));
++        const GLvoid* offset = reinterpret_cast<GLvoid*>(cmdOffset + i * sizeof(draw_elements_indirect_command_t));
+         GLES.glDrawElementsIndirect(mode, type, offset);
+     }
+ 
+@@ -946,14 +1007,15 @@ void mg_glMultiDrawElements_indirect(GLenum mode, const GLsizei* count, GLenum t
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements(md_backend_t::Indirect, mode, count, type, indices, primcount);
+         return;
+     }
+ 
+     for (GLsizei i = 0; i < primcount; ++i) {
+         if (count[i] <= 0) continue;
+-        const GLvoid* offset = reinterpret_cast<GLvoid*>(i * sizeof(draw_elements_indirect_command_t));
++        const GLvoid* offset = reinterpret_cast<GLvoid*>(cmdOffset + i * sizeof(draw_elements_indirect_command_t));
+         GLES.glDrawElementsIndirect(mode, type, offset);
+     }
+ 
+@@ -987,12 +1049,13 @@ void mg_glMultiDrawElementsBaseVertex_multiindirect(GLenum mode, GLsizei* counts
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(counts, type, indices, primcount, basevertex, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements_bv(md_backend_t::MultiIndirect, mode, counts, type, indices, primcount, basevertex);
+         return;
+     }
+ 
+-    GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
++    GLES.glMultiDrawElementsIndirectEXT(mode, type, reinterpret_cast<const void*>(cmdOffset), primcount, 0);
+ 
+     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
+ 
+@@ -1016,12 +1079,13 @@ void mg_glMultiDrawElements_multiindirect(GLenum mode, const GLsizei* count, GLe
+     prepareForDraw();
+ 
+     GLuint prevIndirectBuffer = 0;
+-    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer)) {
++    size_t cmdOffset = 0;
++    if (!prepare_indirect_buffer(count, type, indices, primcount, nullptr, &prevIndirectBuffer, &cmdOffset)) {
+         md_fall_elements(md_backend_t::MultiIndirect, mode, count, type, indices, primcount);
+         return;
+     }
+ 
+-    GLES.glMultiDrawElementsIndirectEXT(mode, type, 0, primcount, 0);
++    GLES.glMultiDrawElementsIndirectEXT(mode, type, reinterpret_cast<const void*>(cmdOffset), primcount, 0);
+ 
+     GLES.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, prevIndirectBuffer);
+ 
