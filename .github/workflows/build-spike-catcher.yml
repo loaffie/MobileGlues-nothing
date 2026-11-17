@@ -18,8 +18,9 @@ jobs:
 
       - uses: actions/setup-java@v4
         with:
-          distribution: zulu
-          java-version: "21"
+          # Loom 1.18 itself needs Java 25 to run; the mod is still compiled for Java 21.
+          distribution: microsoft
+          java-version: "25"
 
       - name: Build
         run: |
