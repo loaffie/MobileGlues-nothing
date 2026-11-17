@@ -1,0 +1,205 @@
+diff --git a/MobileGlues-cpp/egl/egl.cpp b/MobileGlues-cpp/egl/egl.cpp
+index 87e12f4..4257027 100644
+--- a/MobileGlues-cpp/egl/egl.cpp
++++ b/MobileGlues-cpp/egl/egl.cpp
+@@ -409,6 +409,7 @@ namespace {
+     EGLBoolean presentSurface(EGLDisplay dpy, EGLSurface surface) {
+         LOAD_EGL(eglSwapBuffers)
+         if (global_settings.fsr1_setting == FSR1_Quality_Preset::Disabled) {
++            mg_frame_pace();
+             EGLBoolean result;
+             {
+                 mg_ft_scope_t ft(MG_FT_SWAP);
+@@ -418,6 +419,7 @@ namespace {
+             return result;
+         }
+         ApplyFSR();
++        mg_frame_pace();
+         EGLBoolean result;
+         {
+             mg_ft_scope_t ft(MG_FT_SWAP);
+diff --git a/MobileGlues-cpp/gl/framebuffer.cpp b/MobileGlues-cpp/gl/framebuffer.cpp
+index cb2585a..97c0dce 100644
+--- a/MobileGlues-cpp/gl/framebuffer.cpp
++++ b/MobileGlues-cpp/gl/framebuffer.cpp
+@@ -364,6 +364,7 @@ GLAPI GLAPIENTRY void glFramebufferTextureLayerARB(GLenum target, GLenum attachm
+ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1,
+                        GLint dstY1, GLbitfield mask, GLenum filter) {
+     LOG()
++    mg_ft_scope_t mg_ft(MG_FT_BLIT);
+     mg_fsr_read_scope_t fsr_read;
+     GLES.glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
+     CHECK_GL_ERROR
+diff --git a/MobileGlues-cpp/gl/frametime.cpp b/MobileGlues-cpp/gl/frametime.cpp
+index 9cc3e5e..ab5a84c 100644
+--- a/MobileGlues-cpp/gl/frametime.cpp
++++ b/MobileGlues-cpp/gl/frametime.cpp
+@@ -15,9 +15,10 @@
+ #include <cstring>
+ #include <string>
+ 
++#include <ctime>
++#include <sched.h>
+ #ifdef __ANDROID__
+ #include <dlfcn.h>
+-#include <sched.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ #endif
+@@ -42,8 +43,11 @@ namespace {
+ //   "pinRenderThread": 0     leave core placement to Android (default)
+ //   "pinRenderThread": 1     keep the render thread off the slowest cluster ("big")
+ //   "pinRenderThread": 2     keep it on the fastest cores only ("prime")
++//   "frameCapFps": 0         no frame cap of our own (default)
++//   "frameCapFps": N         present at most N frames a second, paced evenly (20..240)
+ int g_cfg_read = 0;
+ int g_cfg_pin = 0;
++int g_cfg_frame_cap = 0;
+ int g_cfg_hitch_log = 1; // light timing unless config.json says otherwise (the app exposes it)
+ int g_cfg_target_fps = 120;
+ 
+@@ -60,11 +64,14 @@ void read_config_once() {
+     }
+     const int pin = config_get_int(const_cast<char*>("pinRenderThread"));
+     if (pin >= 0 && pin <= 2) g_cfg_pin = pin;
++    const int cap = config_get_int(const_cast<char*>("frameCapFps"));
++    if (cap > 0) g_cfg_frame_cap = cap < 20 ? 20 : (cap > 240 ? 240 : cap);
+     g_mg_ft_enabled = g_cfg_hitch_log != 0;
+     g_mg_ft_all = g_cfg_hitch_log >= 2;
+     LOG_V("[MobileGlues] Setting: hitchLog                    = %d", g_cfg_hitch_log)
+     LOG_V("[MobileGlues] Setting: perfHintTargetFps           = %d", g_cfg_target_fps)
+     LOG_V("[MobileGlues] Setting: pinRenderThread             = %d", g_cfg_pin)
++    LOG_V("[MobileGlues] Setting: frameCapFps                 = %d", g_cfg_frame_cap)
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -251,6 +258,66 @@ double ms(uint64_t ns) {
+ 
+ } // namespace
+ 
++// ---------------------------------------------------------------------------
++// Frame cap
++//
++// Minecraft has a frame limiter of its own, but it waits through the launcher's
++// GLFW, and on the Phone (3a) a capped session lost three times as much time to
++// long frames as an uncapped one. This one waits in the swap path instead: a
++// plain sleep for the bulk of the wait, then a short yield loop for the last
++// stretch, because a sleep on Android routinely wakes a millisecond or more late.
++//
++// Frames are released on a fixed grid (last slot + period), so the rate is even
++// and averages exactly the cap. A frame that misses its slot by more than a whole
++// period restarts the grid instead of being followed by a burst of catch-up frames.
++//
++// Meant to be used with Minecraft's own Max Framerate set to Unlimited, so only
++// one limiter is ever in play.
++// ---------------------------------------------------------------------------
++namespace {
++thread_local uint64_t t_pace_slot = 0;
++
++void sleep_until_ns(uint64_t target_ns) {
++    const uint64_t SPIN_NS = 1500000; // last 1.5 ms: yield instead of sleeping
++    for (;;) {
++        const uint64_t now = mg_ft_now();
++        if (now >= target_ns) return;
++        const uint64_t left = target_ns - now;
++        if (left > SPIN_NS) {
++            const uint64_t wake = now + (left - SPIN_NS);
++            timespec ts;
++            ts.tv_sec = static_cast<time_t>(wake / 1000000000ull);
++            ts.tv_nsec = static_cast<long>(wake % 1000000000ull);
++            // mg_ft_now() is steady_clock, which is CLOCK_MONOTONIC on Linux and Android.
++            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
++        } else {
++            sched_yield();
++        }
++    }
++}
++} // namespace
++
++void mg_frame_pace() {
++    read_config_once();
++    if (g_cfg_frame_cap <= 0) return;
++    const uint64_t period = 1000000000ull / static_cast<uint64_t>(g_cfg_frame_cap);
++    const uint64_t now = mg_ft_now();
++    if (t_pace_slot == 0) {
++        t_pace_slot = now;
++        return;
++    }
++    const uint64_t target = t_pace_slot + period;
++    if (now < target) {
++        sleep_until_ns(target);
++        const uint64_t waited = mg_ft_now() - now;
++        g_mg_ft_frame.ns[MG_FT_PACE] += waited;
++        g_mg_ft_frame.calls[MG_FT_PACE] += 1;
++        t_pace_slot = target;
++    } else {
++        t_pace_slot = (now - target > period) ? now : target;
++    }
++}
++
+ void mg_frame_presented() {
+     read_config_once();
+     pin_render_thread_once();
+@@ -271,7 +338,11 @@ void mg_frame_presented() {
+         return;
+     }
+ 
+-    hint_report(dt_ns);
++    // The cap's own wait is not work. Reported as work it would tell the CPU
++    // governor every frame takes the full period, and keep the clocks up for
++    // nothing; left out, a frame that is done early lets the CPU slow down.
++    const uint64_t paced = frame.ns[MG_FT_PACE];
++    hint_report(dt_ns > paced ? dt_ns - paced : dt_ns);
+ 
+     if (!g_cfg_hitch_log) return;
+ 
+@@ -297,9 +368,10 @@ void mg_frame_presented() {
+         // "elsewhere" is everything not timed here: the game's own code and the
+         // JVM (garbage collection included), plus -- unless hitchLog is 2 -- the
+         // GL calls that are forwarded to the driver unchanged.
+-        LOG_V("[hitch] %.1f ms (avg %.1f) | swap %.1f | multidraw %.1f x%u | draw %.1f x%u | buffer %.1f x%u | "
+-              "map %.1f x%u | texture %.1f x%u | shader %.1f x%u | other-gl %.1f x%u | elsewhere %.1f",
+-              dt, p.avg_ms, ms(frame.ns[MG_FT_SWAP]), ms(frame.ns[MG_FT_MULTIDRAW]), frame.calls[MG_FT_MULTIDRAW],
++        LOG_V("[hitch] %.1f ms (avg %.1f) | swap %.1f | blit %.1f | pace %.1f | multidraw %.1f x%u | draw %.1f x%u | "
++              "buffer %.1f x%u | map %.1f x%u | texture %.1f x%u | shader %.1f x%u | other-gl %.1f x%u | elsewhere %.1f",
++              dt, p.avg_ms, ms(frame.ns[MG_FT_SWAP]), ms(frame.ns[MG_FT_BLIT]), ms(frame.ns[MG_FT_PACE]),
++              ms(frame.ns[MG_FT_MULTIDRAW]), frame.calls[MG_FT_MULTIDRAW],
+               ms(frame.ns[MG_FT_DRAW]), frame.calls[MG_FT_DRAW], ms(frame.ns[MG_FT_BUFFER]),
+               frame.calls[MG_FT_BUFFER], ms(frame.ns[MG_FT_MAP]), frame.calls[MG_FT_MAP],
+               ms(frame.ns[MG_FT_TEXTURE]), frame.calls[MG_FT_TEXTURE], ms(frame.ns[MG_FT_SHADER]),
+@@ -345,9 +417,10 @@ void mg_frame_presented() {
+             for (int i = 0; i < MG_FT_COUNT; ++i)
+                 inside += ms(ns[i]);
+             const double outside = total > inside ? total - inside : 0.0;
+-            LOG_V("[frametime] %s %.0f ms: swap %.1f%% | multidraw %.1f%% | draw %.1f%% | buffer %.1f%% | map %.1f%% | "
+-                  "texture %.1f%% | shader %.1f%% | other-gl %.1f%% | elsewhere %.1f%%",
++            LOG_V("[frametime] %s %.0f ms: swap %.1f%% | blit %.1f%% | pace %.1f%% | multidraw %.1f%% | draw %.1f%% | "
++                  "buffer %.1f%% | map %.1f%% | texture %.1f%% | shader %.1f%% | other-gl %.1f%% | elsewhere %.1f%%",
+                   pass == 0 ? "all frames" : "hitches   ", total, 100.0 * ms(ns[MG_FT_SWAP]) / total,
++                  100.0 * ms(ns[MG_FT_BLIT]) / total, 100.0 * ms(ns[MG_FT_PACE]) / total,
+                   100.0 * ms(ns[MG_FT_MULTIDRAW]) / total, 100.0 * ms(ns[MG_FT_DRAW]) / total,
+                   100.0 * ms(ns[MG_FT_BUFFER]) / total, 100.0 * ms(ns[MG_FT_MAP]) / total,
+                   100.0 * ms(ns[MG_FT_TEXTURE]) / total, 100.0 * ms(ns[MG_FT_SHADER]) / total,
+diff --git a/MobileGlues-cpp/gl/frametime.h b/MobileGlues-cpp/gl/frametime.h
+index bf84fa5..3b7678f 100644
+--- a/MobileGlues-cpp/gl/frametime.h
++++ b/MobileGlues-cpp/gl/frametime.h
+@@ -26,6 +26,9 @@ enum mg_ft_cat_t : int {
+     MG_FT_TEXTURE,   // glTexImage2D / glTexSubImage2D
+     MG_FT_SHADER,    // glShaderSource (GLSL translation) / glLinkProgram
+     MG_FT_DRAW,      // glDrawElements* (everything the game draws that is not a multi-draw)
++    MG_FT_BLIT,      // glBlitFramebuffer; Minecraft 1.21 presents with one, and under ANGLE that is
++                     // where the next window image is acquired, i.e. where waiting for the display shows
++    MG_FT_PACE,      // the frame cap's own wait before the swap (frameCapFps)
+     MG_FT_GL,        // every call forwarded to the driver unchanged; only timed at hitchLog 2
+     MG_FT_COUNT
+ };
+@@ -81,4 +84,8 @@ struct mg_ft_native_scope_t : mg_ft_scope_t {
+ // Called once per presented frame, after the swap has returned.
+ void mg_frame_presented();
+ 
++// Called right before the swap. With "frameCapFps" set, holds the frame until its slot
++// comes up, so frames leave at an even rate instead of as fast as the game makes them.
++void mg_frame_pace();
++
+ #endif // MOBILEGLUES_FRAMETIME_H

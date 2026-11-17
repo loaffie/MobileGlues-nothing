@@ -1,0 +1,317 @@
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt b/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt
+index f806adc..e2311f4 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/settings/FrameTimeLog.kt
+@@ -40,6 +40,8 @@ object FrameTimeLog {
+         val pinnedCpus: String? = null,
+         /** True when pinning was asked for and the system refused it. */
+         val pinRefused: Boolean = false,
++        /** The renderer's own frame cap, 0 when off; null on builds that predate it. */
++        val frameCapFps: Int? = null,
+     ) {
+         /**
+          * Windows that describe actual play. The first one includes loading into the world
+@@ -68,7 +70,7 @@ object FrameTimeLog {
+ 
+     /** Display order; also the order the renderer prints them in. */
+     val Categories = listOf(
+-        "swap", "multidraw", "draw", "buffer", "map", "texture", "shader", "other-gl", "elsewhere",
++        "swap", "blit", "pace", "multidraw", "draw", "buffer", "map", "texture", "shader", "other-gl", "elsewhere",
+     )
+ 
+     private val summaryLine = Regex(
+@@ -79,6 +81,7 @@ object FrameTimeLog {
+     private val angleLine = Regex("""Setting: enableAngle\s+= (true|false)""")
+     private val drawPathLine = Regex("""multidrawOrderElementsBaseVertex\s+= ([a-z]+)""")
+     private val hitchLogLine = Regex("""Setting: hitchLog\s+= (\d+)""")
++    private val frameCapLine = Regex("""Setting: frameCapFps\s+= (\d+)""")
+     private val perfHintLine = Regex("""perf hints: (.*)$""")
+     private val pinnedLine = Regex("""render thread pinned to CPUs ([\d ]+)""")
+     private val pinRefusedLine = Regex("""render thread: pinning to CPUs[\d ]+ refused""")
+@@ -91,6 +94,7 @@ object FrameTimeLog {
+         var hitchLog: Int? = null
+         var pinned: String? = null
+         var pinRefused = false
++        var frameCap: Int? = null
+         val windows = mutableListOf<Window>()
+ 
+         for (line in text.lineSequence()) {
+@@ -124,9 +128,10 @@ object FrameTimeLog {
+             if (perfHints == null) perfHintLine.find(line)?.let { perfHints = it.groupValues[1].trim() }
+             if (pinned == null) pinnedLine.find(line)?.let { pinned = it.groupValues[1].trim() }
+             if (pinRefusedLine.containsMatchIn(line)) pinRefused = true
++            if (frameCap == null) frameCapLine.find(line)?.let { frameCap = it.groupValues[1].toIntOrNull() }
+         }
+ 
+         if (windows.isEmpty() && angle == null && drawPath == null) return null
+-        return Report(angle, drawPath, perfHints, hitchLog, windows, pinned, pinRefused)
++        return Report(angle, drawPath, perfHints, hitchLog, windows, pinned, pinRefused, frameCap)
+     }
+ }
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt
+index f079c12..b833029 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfig.kt
+@@ -382,6 +382,24 @@ enum class RenderThreadPin(override val wire: Int, @param:StringRes private val
+     override fun label(context: Context): CharSequence = context.getString(labelRes)
+ }
+ 
++/**
++ * `frameCapFps` (MobileGlues Nothing): the renderer's own evenly paced frame cap.
++ *
++ * 0 is off. Meant to replace Minecraft's Max Framerate, which should then be Unlimited.
++ */
++object FrameCap {
++    const val OFF = 0
++    val Choices = listOf(OFF, 60, 90, 120)
++
++    fun fromWire(wire: Int?): Int = when {
++        wire == null || wire <= 0 -> OFF
++        else -> wire.coerceIn(20, 240)
++    }
++
++    fun label(context: Context, fps: Int): String =
++        if (fps == OFF) context.getString(R.string.nt_cap_off) else context.getString(R.string.nt_cap_fps, fps)
++}
++
+ /**
+  * `perfHintTargetFps` (MobileGlues Nothing): the frame rate the CPU performance hints aim for.
+  *
+@@ -423,6 +441,7 @@ data class MGConfig(
+     val hitchLog: HitchLogLevel = HitchLogLevel.Light,
+     val perfHintFps: Int = PerfHintTarget.DEFAULT,
+     val pinRenderThread: RenderThreadPin = RenderThreadPin.Auto,
++    val frameCapFps: Int = FrameCap.OFF,
+ ) {
+     val fsr1Enabled: Boolean get() = fsr1 != Fsr1Preset.Disabled
+ 
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt
+index 484c8f0..41e4d91 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/settings/MGConfigCodec.kt
+@@ -37,6 +37,7 @@ internal object MGConfigCodec {
+     private const val KEY_HITCH_LOG = "hitchLog"
+     private const val KEY_PERF_HINT_FPS = "perfHintTargetFps"
+     private const val KEY_PIN_RENDER_THREAD = "pinRenderThread"
++    private const val KEY_FRAME_CAP = "frameCapFps"
+ 
+     private val KNOWN_KEYS = listOf(
+         KEY_ANGLE,
+@@ -54,6 +55,7 @@ internal object MGConfigCodec {
+         KEY_HITCH_LOG,
+         KEY_PERF_HINT_FPS,
+         KEY_PIN_RENDER_THREAD,
++        KEY_FRAME_CAP,
+     ) + MultidrawEntry.entries.flatMap { listOf(it.orderKey, it.legacyModeKey) }
+ 
+     fun decode(root: JsonObject): MGConfig {
+@@ -80,6 +82,7 @@ internal object MGConfigCodec {
+             perfHintFps = PerfHintTarget.fromWire(root.intOrNull(KEY_PERF_HINT_FPS)),
+             pinRenderThread = RenderThreadPin.entries
+                 .fromWire(root.intOrNull(KEY_PIN_RENDER_THREAD), defaults.pinRenderThread),
++            frameCapFps = FrameCap.fromWire(root.intOrNull(KEY_FRAME_CAP)),
+         )
+     }
+ 
+@@ -97,6 +100,7 @@ internal object MGConfigCodec {
+             addProperty(KEY_HITCH_LOG, config.hitchLog.wire)
+             addProperty(KEY_PERF_HINT_FPS, config.perfHintFps)
+             addProperty(KEY_PIN_RENDER_THREAD, config.pinRenderThread.wire)
++            addProperty(KEY_FRAME_CAP, config.frameCapFps)
+             encodeMultidraw(config.multidraw)
+         }
+ 
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt b/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt
+index 9c5a277..54fd9e1 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/ui/NothingFeatures.kt
+@@ -7,6 +7,7 @@ import androidx.core.content.FileProvider
+ import com.fcl.plugin.mobileglues.R
+ import com.fcl.plugin.mobileglues.settings.AngleConfig
+ import com.fcl.plugin.mobileglues.settings.AuthController
++import com.fcl.plugin.mobileglues.settings.FrameCap
+ import com.fcl.plugin.mobileglues.settings.FrameTimeLog
+ import com.fcl.plugin.mobileglues.settings.Fsr1Preset
+ import com.fcl.plugin.mobileglues.settings.HitchLogLevel
+@@ -41,6 +42,8 @@ class NothingFeatures(
+ 
+     fun setHitchLog(level: HitchLogLevel) = configStore.update { it.copy(hitchLog = level) }
+ 
++    fun setFrameCap(fps: Int) = configStore.update { it.copy(frameCapFps = FrameCap.fromWire(fps)) }
++
+     fun setRenderThreadPin(pin: RenderThreadPin) = configStore.update { it.copy(pinRenderThread = pin) }
+ 
+     fun setPerfHintFps(fps: Int) = configStore.update { it.copy(perfHintFps = PerfHintTarget.fromWire(fps)) }
+@@ -59,6 +62,7 @@ class NothingFeatures(
+                 perfHintFps = 120,
+                 hitchLog = HitchLogLevel.Off,
+                 fsr1 = Fsr1Preset.Disabled,
++                frameCapFps = 120,
+             )
+         }),
+ 
+@@ -68,6 +72,7 @@ class NothingFeatures(
+                 angle = AngleConfig.EnableIfPossible,
+                 perfHintFps = PerfHintTarget.OFF,
+                 hitchLog = HitchLogLevel.Off,
++                frameCapFps = 90,
+             )
+         }),
+ 
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt
+index d70c085..790c6ac 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialFrameTime.kt
+@@ -128,11 +128,17 @@ private fun ReportContent(controller: AppController, report: FrameTimeLog.Report
+         }
+         report.chunkDrawPath?.let { StatusChip(it, true) }
+     }
+-    if (report.pinnedCpus != null || report.pinRefused) {
+-        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = ScreenPadding)) {
++    if (report.pinnedCpus != null || report.pinRefused || (report.frameCapFps ?: 0) > 0) {
++        Row(
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++            modifier = Modifier.fillMaxWidth().padding(horizontal = ScreenPadding),
++        ) {
++            report.frameCapFps?.takeIf { it > 0 }?.let {
++                StatusChip(stringResource(R.string.nt_chip_cap, it), true)
++            }
+             if (report.pinnedCpus != null) {
+                 StatusChip(stringResource(R.string.nt_chip_pinned, report.pinnedCpus), true)
+-            } else {
++            } else if (report.pinRefused) {
+                 StatusChip(stringResource(R.string.nt_chip_pin_refused), false)
+             }
+         }
+@@ -189,10 +195,13 @@ private fun ReportContent(controller: AppController, report: FrameTimeLog.Report
+             )
+         } else {
+             val outside = breakdown["elsewhere"] ?: 0.0
++            val idle = breakdown["pace"] ?: 0.0
++            val busy = (100.0 - idle).coerceAtLeast(1.0)
++            val gameShare = outside / busy * 100.0
+             Text(
+                 text = stringResource(
+-                    if (outside >= 60.0) R.string.nt_verdict_game else R.string.nt_verdict_renderer,
+-                    (100.0 - outside).roundToInt(),
++                    if (gameShare >= 60.0) R.string.nt_verdict_game else R.string.nt_verdict_renderer,
++                    ((busy - outside) / busy * 100.0).roundToInt(),
+                 ),
+                 style = MaterialTheme.typography.bodyLarge,
+                 color = MaterialTheme.colorScheme.onSurface,
+@@ -203,7 +212,7 @@ private fun ReportContent(controller: AppController, report: FrameTimeLog.Report
+                 BreakdownRow(
+                     label = categoryLabel(key),
+                     share = share,
+-                    accent = key != "elsewhere" && share >= 15.0,
++                    accent = key != "elsewhere" && key != "pace" && share >= 15.0,
+                 )
+             }
+             Spacer(Modifier.height(10.dp))
+@@ -355,6 +364,8 @@ private fun BreakdownRow(label: String, share: Double, accent: Boolean) {
+ private fun categoryLabel(key: String): String = stringResource(
+     when (key) {
+         "swap" -> R.string.nt_cat_swap
++        "blit" -> R.string.nt_cat_blit
++        "pace" -> R.string.nt_cat_pace
+         "multidraw" -> R.string.nt_cat_multidraw
+         "draw" -> R.string.nt_cat_draw
+         "buffer" -> R.string.nt_cat_buffer
+diff --git a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt
+index cae4ba1..d1d0377 100644
+--- a/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt
++++ b/app/src/main/java/com/fcl/plugin/mobileglues/ui/material/MaterialSettings.kt
+@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.FlowRow
+ import androidx.compose.material3.OutlinedButton
+ import com.fcl.plugin.mobileglues.settings.HitchLogLevel
++import com.fcl.plugin.mobileglues.settings.FrameCap
+ import com.fcl.plugin.mobileglues.settings.PerfHintTarget
+ import com.fcl.plugin.mobileglues.settings.RenderThreadPin
+ import com.fcl.plugin.mobileglues.ui.AppSubPage
+@@ -148,6 +149,7 @@ private fun ConfigSections(controller: AppController, config: MGConfig) {
+             onPickBoost = { choice = ChoiceTarget.PerfHint },
+             onPickLogging = { choice = ChoiceTarget.HitchLog },
+             onPickPin = { choice = ChoiceTarget.Pin },
++            onPickCap = { choice = ChoiceTarget.Cap },
+         )
+ 
+         PreferenceGroup(title = stringResource(R.string.settings_group_render)) {
+@@ -277,6 +279,17 @@ private fun ConfigSections(controller: AppController, config: MGConfig) {
+             )
+         }
+ 
++        ChoiceTarget.Cap -> {
++            val choices = (FrameCap.Choices + config.frameCapFps).distinct()
++            SingleChoiceDialog(
++                title = stringResource(R.string.nt_cap_title),
++                options = choices.map { FrameCap.label(context, it) },
++                selectedIndex = choices.indexOf(config.frameCapFps),
++                onSelect = { controller.nothing.setFrameCap(choices[it]) },
++                onDismiss = { choice = null },
++            )
++        }
++
+         ChoiceTarget.Pin -> OptionDialog(
+             title = stringResource(R.string.nt_pin_title),
+             options = RenderThreadPin.entries,
+@@ -349,7 +362,7 @@ private fun <T : SpinnerOption> OptionDialog(
+     )
+ }
+ 
+-private enum class ChoiceTarget { Angle, NoError, DepthClear, GlVersion, PerfHint, HitchLog, Pin }
++private enum class ChoiceTarget { Angle, NoError, DepthClear, GlVersion, PerfHint, HitchLog, Pin, Cap }
+ 
+ /**
+  * MobileGlues Nothing: presets, the two settings the patched renderer reads, and the way to the
+@@ -362,6 +375,7 @@ private fun NtTuningGroup(
+     onPickBoost: () -> Unit,
+     onPickLogging: () -> Unit,
+     onPickPin: () -> Unit,
++    onPickCap: () -> Unit,
+ ) {
+     val context = LocalContext.current
+     val matching = controller.nothing.matchingPreset(config)
+@@ -400,6 +414,11 @@ private fun NtTuningGroup(
+                 stringResource(R.string.nt_boost_hint),
+             onClick = onPickBoost,
+         )
++        TextPreferenceRow(
++            title = stringResource(R.string.nt_cap_title),
++            summary = FrameCap.label(context, config.frameCapFps) + " · " + stringResource(R.string.nt_cap_hint),
++            onClick = onPickCap,
++        )
+         TextPreferenceRow(
+             title = stringResource(R.string.nt_pin_title),
+             summary = config.pinRenderThread.label(context).toString(),
+diff --git a/app/src/main/res/values/strings_nothing.xml b/app/src/main/res/values/strings_nothing.xml
+index f9ccdb6..8097b01 100644
+--- a/app/src/main/res/values/strings_nothing.xml
++++ b/app/src/main/res/values/strings_nothing.xml
+@@ -7,9 +7,9 @@
+     <string name="nt_group_tuning">Tuning</string>
+     <string name="nt_presets">One-tap presets</string>
+     <string name="nt_preset_pvp">PvP</string>
+-    <string name="nt_preset_pvp_summary">ANGLE, CPU boost at 120 fps, no logging. What tested best on this phone.</string>
++    <string name="nt_preset_pvp_summary">ANGLE, evenly paced 120 fps cap, CPU boost, no logging. Set Minecraft\'s Max Framerate to Unlimited.</string>
+     <string name="nt_preset_cooler">Cooler</string>
+-    <string name="nt_preset_cooler_summary">ANGLE, no CPU boost, no logging. Less heat on long sessions, can stutter more.</string>
++    <string name="nt_preset_cooler_summary">ANGLE, 90 fps cap, no CPU boost, no logging. Less heat on long sessions.</string>
+     <string name="nt_preset_diagnose">Diagnose</string>
+     <string name="nt_preset_diagnose_summary">Full frame-time logging for one session. Costs some FPS; switch back afterwards.</string>
+     <string name="nt_preset_custom">Custom settings. Tap a preset to apply it.</string>
+@@ -20,6 +20,14 @@
+     <string name="nt_boost_off">Off</string>
+     <string name="nt_boost_fps">%1$d fps</string>
+ 
++    <string name="nt_cap_title">Frame cap</string>
++    <string name="nt_cap_off">Off (use Minecraft\'s Max Framerate)</string>
++    <string name="nt_cap_fps">%1$d fps, evenly paced</string>
++    <string name="nt_cap_hint">set Minecraft\'s Max Framerate to Unlimited when using this</string>
++    <string name="nt_chip_cap">Capped at %1$d fps</string>
++    <string name="nt_cat_blit">Copy to screen</string>
++    <string name="nt_cat_pace">Frame cap wait</string>
++
+     <string name="nt_pin_title">Render thread cores</string>
+     <string name="nt_pin_auto">Let Android decide (default)</string>
+     <string name="nt_pin_big">Big cores only (skip the slow cores)</string>

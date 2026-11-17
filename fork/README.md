@@ -50,6 +50,16 @@ Both can be changed in `/sdcard/MG/config.json`:
   each core's maximum clock, not from core numbers. Measurements elsewhere found this helps on some SoCs and
   hurts on others, so it is a switch to A/B; the log says which CPUs were used.
 
+`patches/0004-precise-frame-cap-and-blit-timing.patch` (`gl/frametime.cpp`, `egl/egl.cpp`, `gl/framebuffer.cpp`)
+
+- **Frame cap** (`"frameCapFps"`, off by default). An evenly paced cap applied in the swap path: a sleep for most
+  of the wait, then a short yield loop, because a sleep on Android often wakes late. Use it with Minecraft's Max
+  Framerate on Unlimited. Measured on the Phone (3a), Minecraft's own 120 cap lost about three times as much time
+  to long frames as running uncapped. The cap's wait is left out of the CPU-boost reports, so early frames let the
+  CPU slow down.
+- The log now times `glBlitFramebuffer` (`blit`; Minecraft 1.21 presents with it, and under ANGLE that is where the
+  next window image is acquired) and the cap's wait (`pace`) separately.
+
 ## App changes
 
 `app-patches/0001-dot-matrix-theme-and-tuning-features.patch` changes the plugin app itself (Material style only):
@@ -57,7 +67,7 @@ Both can be changed in `/sdcard/MG/config.json`:
 - Monochrome theme with one red accent, dot-matrix headings and numbers, a faint dot grid behind pages,
   and a matching launcher icon. The font is Doto (SIL Open Font License, shipped in
   `assets/licenses/Doto-OFL.txt`).
-- **Settings → Tuning**: one-tap presets (PvP, Cooler, Diagnose), CPU boost target, render thread cores,
+- **Settings → Tuning**: one-tap presets (PvP, Cooler, Diagnose), frame cap, CPU boost target, render thread cores,
   frame-time logging level, the last-session report and a button to share `latest.log`.
 - **Last session report**: typical FPS, worst frame and hitches per second, an FPS chart per 30 s, and
   where the frame time went, all read from `latest.log`.
