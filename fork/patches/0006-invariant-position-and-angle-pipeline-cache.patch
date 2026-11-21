@@ -1,0 +1,457 @@
+diff --git a/MobileGlues-cpp/CMakeLists.txt b/MobileGlues-cpp/CMakeLists.txt
+index 00bb17b..edbe8c0 100644
+--- a/MobileGlues-cpp/CMakeLists.txt
++++ b/MobileGlues-cpp/CMakeLists.txt
+@@ -119,6 +119,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
+ 
+     gl/vertexattrib.cpp
+     glx/lookup.cpp
++    egl/blobcache.cpp
+     egl/egl.cpp
+     egl/loader.cpp
+     gles/loader.cpp
+diff --git a/MobileGlues-cpp/config/config.cpp b/MobileGlues-cpp/config/config.cpp
+index 9d11453..a1562ce 100644
+--- a/MobileGlues-cpp/config/config.cpp
++++ b/MobileGlues-cpp/config/config.cpp
+@@ -46,7 +46,7 @@ int check_path() {
+     }
+     config_file_path = concatenate(mg_directory_path, "/config.json");
+     log_file_path = concatenate(mg_directory_path, "/latest.log");
+-    glsl_cache_file_path = concatenate(mg_directory_path, "/glsl_cache.tmp");
++    glsl_cache_file_path = concatenate(mg_directory_path, "/glsl_cache_inv1.tmp");
+     stats_file_path = concatenate(mg_directory_path, "/stats.json");
+ 
+     if (mkdir(mg_directory_path, 0755) != 0 && errno != EEXIST) {
+diff --git a/MobileGlues-cpp/egl/blobcache.cpp b/MobileGlues-cpp/egl/blobcache.cpp
+new file mode 100644
+index 0000000..be64e34
+--- /dev/null
++++ b/MobileGlues-cpp/egl/blobcache.cpp
+@@ -0,0 +1,231 @@
++// MobileGlues - egl/blobcache.cpp
++// Copyright (c) 2025-2026 MobileGL-Dev
++// Licensed under the GNU Lesser General Public License v2.1:
++//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
++// SPDX-License-Identifier: LGPL-2.1-only
++// End of Source File Header
++
++#include "blobcache.h"
++#include "../config/config.h"
++#include "../config/settings.h"
++#include "../gl/log.h"
++#include "../gl/mg.h"
++#include "../gles/loader.h"
++#include "loader.h"
++
++#include <EGL/eglext.h>
++#include <atomic>
++#include <cerrno>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <string>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++namespace {
++
++// File layout: magic, key size, value size, key, value. The key is stored so a file name
++// collision is a miss and not somebody else's data.
++constexpr uint32_t kMagic = 0x4342474Du; // "MGBC"
++constexpr size_t kMaxValue = 48u * 1024u * 1024u;
++constexpr int kMaxLoggedEvents = 24;
++
++std::string g_dir;
++std::atomic<int> g_logged{0};
++std::atomic<uint64_t> g_hits{0};
++std::atomic<uint64_t> g_misses{0};
++std::atomic<uint64_t> g_saved{0};
++
++struct Pending {
++    std::string name;
++    std::vector<unsigned char> bytes; // the whole file, ready to write
++};
++
++// Never destroyed. The writer thread sleeps on the condition variable for the life of the
++// process, and destroying a condition variable somebody is waiting on blocks forever in
++// glibc, so the usual static destructors at exit would hang the game's shutdown.
++struct Shared {
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::map<std::string, Pending> pending; // newest write per file wins
++    bool writer_started = false;
++};
++Shared& shared() {
++    static Shared* s = new Shared();
++    return *s;
++}
++
++uint64_t fnv1a(const unsigned char* p, size_t n) {
++    uint64_t h = 1469598103934665603ull;
++    for (size_t i = 0; i < n; ++i) {
++        h ^= p[i];
++        h *= 1099511628211ull;
++    }
++    return h;
++}
++
++std::string name_for(const void* key, size_t size) {
++    char buf[24];
++    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(fnv1a(static_cast<const unsigned char*>(key), size)));
++    return std::string(buf);
++}
++
++void log_event(const char* what, const std::string& name, size_t bytes) {
++    if (g_logged.fetch_add(1) < kMaxLoggedEvents) {
++        LOG_V("[angle-cache] %s %s (%.1f KB)", what, name.c_str(), static_cast<double>(bytes) / 1024.0)
++    }
++}
++
++void write_file(const Pending& p) {
++    const std::string path = g_dir + "/" + p.name;
++    const std::string tmp = path + ".tmp";
++    FILE* f = std::fopen(tmp.c_str(), "wb");
++    if (!f) return;
++    const bool ok = std::fwrite(p.bytes.data(), 1, p.bytes.size(), f) == p.bytes.size();
++    const bool closed = std::fclose(f) == 0;
++    if (!(ok && closed) || std::rename(tmp.c_str(), path.c_str()) != 0) {
++        std::remove(tmp.c_str());
++        return;
++    }
++    g_saved.fetch_add(1);
++    log_event("saved", p.name, p.bytes.size());
++}
++
++void writer_main() {
++    std::unique_lock<std::mutex> lock(shared().mutex);
++    for (;;) {
++        shared().wake.wait(lock, [] { return !shared().pending.empty(); });
++        auto it = shared().pending.begin();
++        Pending job = std::move(it->second);
++        shared().pending.erase(it);
++        lock.unlock();
++        write_file(job);
++        lock.lock();
++    }
++}
++
++// EGLSetBlobFuncANDROID
++void set_blob(const void* key, EGLsizeiANDROID key_size, const void* value, EGLsizeiANDROID value_size) {
++    if (!key || !value || key_size <= 0 || value_size <= 0 || static_cast<size_t>(value_size) > kMaxValue) return;
++    Pending p;
++    p.name = name_for(key, static_cast<size_t>(key_size));
++    const uint32_t header[3] = {kMagic, static_cast<uint32_t>(key_size), static_cast<uint32_t>(value_size)};
++    p.bytes.resize(sizeof(header) + static_cast<size_t>(key_size) + static_cast<size_t>(value_size));
++    std::memcpy(p.bytes.data(), header, sizeof(header));
++    std::memcpy(p.bytes.data() + sizeof(header), key, static_cast<size_t>(key_size));
++    std::memcpy(p.bytes.data() + sizeof(header) + static_cast<size_t>(key_size), value, static_cast<size_t>(value_size));
++    {
++        std::lock_guard<std::mutex> lock(shared().mutex);
++        shared().pending[p.name] = std::move(p);
++    }
++    shared().wake.notify_one();
++}
++
++// EGLGetBlobFuncANDROID. Returns the size of the entry, or 0 if there is none. The value is
++// copied only if the caller's buffer is large enough.
++EGLsizeiANDROID get_blob(const void* key, EGLsizeiANDROID key_size, void* value, EGLsizeiANDROID value_size) {
++    if (!key || key_size <= 0) return 0;
++    const std::string name = name_for(key, static_cast<size_t>(key_size));
++
++    // A write that has not reached the disk yet is still the newest answer.
++    {
++        std::lock_guard<std::mutex> lock(shared().mutex);
++        auto it = shared().pending.find(name);
++        if (it != shared().pending.end()) {
++            const std::vector<unsigned char>& b = it->second.bytes;
++            const size_t off = 3 * sizeof(uint32_t) + static_cast<size_t>(key_size);
++            const size_t size = b.size() - off;
++            if (value && static_cast<size_t>(value_size) >= size) std::memcpy(value, b.data() + off, size);
++            return static_cast<EGLsizeiANDROID>(size);
++        }
++    }
++
++    FILE* f = std::fopen((g_dir + "/" + name).c_str(), "rb");
++    if (!f) {
++        g_misses.fetch_add(1);
++        return 0;
++    }
++    uint32_t header[3];
++    EGLsizeiANDROID result = 0;
++    if (std::fread(header, sizeof(header), 1, f) == 1 && header[0] == kMagic &&
++        header[1] == static_cast<uint32_t>(key_size) && header[2] > 0 && header[2] <= kMaxValue) {
++        std::vector<unsigned char> stored(header[1]);
++        if (std::fread(stored.data(), 1, stored.size(), f) == stored.size() &&
++            std::memcmp(stored.data(), key, stored.size()) == 0) {
++            result = static_cast<EGLsizeiANDROID>(header[2]);
++            if (value && value_size >= result) {
++                if (std::fread(value, 1, header[2], f) != header[2]) result = 0;
++            }
++        }
++    }
++    std::fclose(f);
++    if (result > 0) {
++        g_hits.fetch_add(1);
++        if (value && value_size >= result) log_event("hit", name, static_cast<size_t>(result));
++    } else {
++        g_misses.fetch_add(1);
++    }
++    return result;
++}
++
++} // namespace
++
++void mg_angle_install_blob_cache(EGLDisplay dpy) {
++    if (dpy == EGL_NO_DISPLAY) return;
++    if (global_settings.angle != AngleMode::Enabled) return;
++    if (config_get_int(const_cast<char*>("angleBlobCache")) == 0) return;
++
++    // Once per display: ANGLE refuses a second set, and a refused EGL call would leave an
++    // error behind for the application's next eglGetError to find.
++    static std::mutex seen_mutex;
++    static std::vector<EGLDisplay> seen;
++    {
++        std::lock_guard<std::mutex> lock(seen_mutex);
++        for (EGLDisplay d : seen)
++            if (d == dpy) return;
++        seen.push_back(dpy);
++    }
++
++    LOAD_EGL(eglQueryString)
++    if (!egl_eglQueryString) return;
++    const char* ext = egl_eglQueryString(dpy, EGL_EXTENSIONS);
++    if (!ext || !std::strstr(ext, "EGL_ANDROID_blob_cache")) {
++        LOG_V("[angle-cache] not available: ANGLE does not offer EGL_ANDROID_blob_cache")
++        return;
++    }
++
++    typedef void (*set_funcs_t)(EGLDisplay, EGLSetBlobFuncANDROID, EGLGetBlobFuncANDROID);
++    set_funcs_t set_funcs = (egl != NULL) ? reinterpret_cast<set_funcs_t>(proc_address(egl, "eglSetBlobCacheFuncsANDROID")) : nullptr;
++    if (!set_funcs) {
++        LOAD_EGL(eglGetProcAddress)
++        if (egl_eglGetProcAddress)
++            set_funcs = reinterpret_cast<set_funcs_t>(egl_eglGetProcAddress("eglSetBlobCacheFuncsANDROID"));
++    }
++    if (!set_funcs) {
++        LOG_V("[angle-cache] not available: eglSetBlobCacheFuncsANDROID not found")
++        return;
++    }
++
++    if (!mg_directory_path) return;
++    g_dir = std::string(mg_directory_path) + "/angle_cache";
++    if (mkdir(g_dir.c_str(), 0755) != 0 && errno != EEXIST) {
++        LOG_V("[angle-cache] not available: cannot create %s", g_dir.c_str())
++        return;
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(shared().mutex);
++        if (!shared().writer_started) {
++            shared().writer_started = true;
++            std::thread(writer_main).detach();
++        }
++    }
++    set_funcs(dpy, set_blob, get_blob);
++    LOG_V("[angle-cache] pipelines are kept in %s", g_dir.c_str())
++}
+diff --git a/MobileGlues-cpp/egl/blobcache.h b/MobileGlues-cpp/egl/blobcache.h
+new file mode 100644
+index 0000000..6a972c7
+--- /dev/null
++++ b/MobileGlues-cpp/egl/blobcache.h
+@@ -0,0 +1,27 @@
++// MobileGlues - egl/blobcache.h
++// Copyright (c) 2025-2026 MobileGL-Dev
++// Licensed under the GNU Lesser General Public License v2.1:
++//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
++// SPDX-License-Identifier: LGPL-2.1-only
++// End of Source File Header
++
++#ifndef MOBILEGLUES_BLOBCACHE_H
++#define MOBILEGLUES_BLOBCACHE_H
++
++#include <EGL/egl.h>
++
++// Keeps ANGLE's compiled pipelines between launches.
++//
++// ANGLE's Vulkan backend compiles a pipeline the first time a draw needs one, and the
++// calling thread waits for it. Those waits show up in the frame log as a long glDrawArrays
++// or glDrawElements. ANGLE can save what it compiled through EGL_ANDROID_blob_cache, but
++// only if the application provides the storage, and nothing here did, so every launch
++// started cold. This provides it: one file per entry under <MG dir>/angle_cache, written
++// from a background thread.
++//
++// Call it on a display that is initialised and has no context yet. It does nothing unless
++// ANGLE is the backend, and it stops at the first thing it cannot do. "angleBlobCache": 0
++// in config.json turns it off.
++void mg_angle_install_blob_cache(EGLDisplay dpy);
++
++#endif // MOBILEGLUES_BLOBCACHE_H
+diff --git a/MobileGlues-cpp/egl/egl.cpp b/MobileGlues-cpp/egl/egl.cpp
+index 4257027..e15f123 100644
+--- a/MobileGlues-cpp/egl/egl.cpp
++++ b/MobileGlues-cpp/egl/egl.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "egl.h"
+ #include "context.h"
++#include "blobcache.h"
+ #include "../config/settings.h"
+ #include "../gl/FSR1/FSR1.h"
+ #include "../gl/frametime.h"
+@@ -543,6 +544,7 @@ extern "C"
+         if (result == EGL_TRUE) {
+             ETRACE("eglInitialize(%p) -> EGL %d.%d", dpy, major ? *major : -1, minor ? *minor : -1);
+             mg_display_initialised(dpy, false);
++            mg_angle_install_blob_cache(dpy);
+         } else {
+             // Not read here: eglGetError is a single destructive latch, and the
+             // real code belongs to whoever calls eglGetError() next, normally the
+diff --git a/MobileGlues-cpp/egl/loader.cpp b/MobileGlues-cpp/egl/loader.cpp
+index 7f957f3..a8bf260 100644
+--- a/MobileGlues-cpp/egl/loader.cpp
++++ b/MobileGlues-cpp/egl/loader.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "loader.h"
+ #include "context.h"
++#include "blobcache.h"
+ #include "../gl/envvars.h"
+ #include "../gl/log.h"
+ #include "../gl/mg.h"
+@@ -68,6 +69,9 @@ void init_target_egl() {
+ 
+     if (egl_eglInitialize(eglDisplay, NULL, NULL) == EGL_TRUE) {
+         mg_display_initialised(eglDisplay, true);
++        // Before the probe's context below: ANGLE reads its saved pipelines when the first
++        // context is created.
++        mg_angle_install_blob_cache(eglDisplay);
+     } else {
+         LOG_E("eglInitialize failed (0x%x)", egl_eglGetError());
+         goto cleanup;
+diff --git a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+index c7eee88..8ed0da2 100644
+--- a/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
++++ b/MobileGlues-cpp/gl/glsl/glsl_for_es.cpp
+@@ -20,6 +20,8 @@
+ #include <algorithm>
+ #include <sstream>
+ #include "cache.h"
++#include "spirv_invariant.h"
++#include "../../config/config.h"
+ #include "../../version.h"
+ 
+ #define DEBUG 0
+@@ -743,6 +745,10 @@ std::vector<unsigned int> glsl_to_spirv(GLenum shader_type, int glsl_version, co
+     glslang::SpvOptions spvOptions;
+     spvOptions.disableOptimizer = false;
+     glslang::GlslangToSpv(*program.getIntermediate(shader_language), spirv_code, &spvOptions);
++    // "invariantPosition": 0 in config.json turns this off. Anything else, or nothing, leaves it on.
++    static const bool invariant_position = config_get_int(const_cast<char*>("invariantPosition")) != 0;
++    if (invariant_position && shader_language == EShLanguage::EShLangVertex)
++        mg_spirv_mark_position_invariant(spirv_code);
+     errc = 0;
+     return spirv_code;
+ }
+diff --git a/MobileGlues-cpp/gl/glsl/spirv_invariant.h b/MobileGlues-cpp/gl/glsl/spirv_invariant.h
+new file mode 100644
+index 0000000..8a65e08
+--- /dev/null
++++ b/MobileGlues-cpp/gl/glsl/spirv_invariant.h
+@@ -0,0 +1,90 @@
++// MobileGlues - gl/glsl/spirv_invariant.h
++// Copyright (c) 2025-2026 MobileGL-Dev
++// Licensed under the GNU Lesser General Public License v2.1:
++//   https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
++// SPDX-License-Identifier: LGPL-2.1-only
++// End of Source File Header
++
++#ifndef MOBILEGLUES_SPIRV_INVARIANT_H
++#define MOBILEGLUES_SPIRV_INVARIANT_H
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++// Makes the vertex position of a vertex-stage SPIR-V module invariant.
++//
++// Minecraft draws the same block face with different programs: Sodium compiles one
++// vertex shader per render pass (solid, cutout, translucent). Decals such as leaf
++// litter and the grass under them are then positioned by two separately compiled
++// copies of the same arithmetic. A mobile GPU compiler is free to contract a
++// multiply and an add into one fused operation in one copy and not the other, so
++// the two depths can differ in the last bits and the surfaces fight over the pixel.
++// On the desktop drivers the game is written for this does not happen in practice.
++// The `invariant` qualifier is the language's way of asking for the same result
++// from every program that computes the same expression.
++//
++// This adds the Invariant decoration next to the BuiltIn Position decoration. If
++// the shader already has it, or there is no position output, nothing changes.
++// Returns true if the module was changed.
++inline bool mg_spirv_mark_position_invariant(std::vector<unsigned int>& spv) {
++    constexpr uint32_t kMagic = 0x07230203u;
++    constexpr uint32_t kOpDecorate = 71;
++    constexpr uint32_t kOpMemberDecorate = 72;
++    constexpr uint32_t kDecorationBuiltIn = 11;
++    constexpr uint32_t kDecorationInvariant = 18;
++    constexpr uint32_t kBuiltInPosition = 0;
++
++    if (spv.size() < 5 || spv[0] != kMagic) return false;
++
++    struct Marked {
++        uint32_t id;
++        uint32_t member;
++        bool is_member;
++    };
++    std::vector<Marked> already;
++    bool found = false;
++    Marked pos{0, 0, false};
++    size_t insert_at = 0;
++
++    for (size_t i = 5; i < spv.size();) {
++        const uint32_t op = spv[i] & 0xFFFFu;
++        const uint32_t wc = spv[i] >> 16;
++        if (wc == 0 || i + wc > spv.size()) return false; // malformed: leave it alone
++        if (op == kOpDecorate && wc >= 3) {
++            const uint32_t dec = spv[i + 2];
++            if (dec == kDecorationInvariant) {
++                already.push_back({spv[i + 1], 0, false});
++            } else if (dec == kDecorationBuiltIn && wc >= 4 && spv[i + 3] == kBuiltInPosition && !found) {
++                found = true;
++                pos = {spv[i + 1], 0, false};
++                insert_at = i + wc;
++            }
++        } else if (op == kOpMemberDecorate && wc >= 4) {
++            const uint32_t dec = spv[i + 3];
++            if (dec == kDecorationInvariant) {
++                already.push_back({spv[i + 1], spv[i + 2], true});
++            } else if (dec == kDecorationBuiltIn && wc >= 5 && spv[i + 4] == kBuiltInPosition && !found) {
++                found = true;
++                pos = {spv[i + 1], spv[i + 2], true};
++                insert_at = i + wc;
++            }
++        }
++        i += wc;
++    }
++
++    if (!found) return false;
++    for (const Marked& m : already)
++        if (m.id == pos.id && m.is_member == pos.is_member && (!m.is_member || m.member == pos.member)) return false;
++
++    if (pos.is_member) {
++        const unsigned int words[4] = {(4u << 16) | kOpMemberDecorate, pos.id, pos.member, kDecorationInvariant};
++        spv.insert(spv.begin() + static_cast<std::ptrdiff_t>(insert_at), words, words + 4);
++    } else {
++        const unsigned int words[3] = {(3u << 16) | kOpDecorate, pos.id, kDecorationInvariant};
++        spv.insert(spv.begin() + static_cast<std::ptrdiff_t>(insert_at), words, words + 3);
++    }
++    return true;
++}
++
++#endif // MOBILEGLUES_SPIRV_INVARIANT_H

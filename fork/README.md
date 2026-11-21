@@ -72,6 +72,23 @@ Both can be changed in `/sdcard/MG/config.json`:
   `/sys/class/thermal`. An app is not always allowed to read those; what cannot be read is left out, and a missing
   GPU clock prints `gpu clock unreadable`. Runs at `hitchLog` 1 and 2.
 
+`patches/0006-invariant-position-and-angle-pipeline-cache.patch` (`gl/glsl/`, `egl/`, `config/config.cpp`)
+
+Found on a Galaxy S22+ (Adreno 730, ANGLE on):
+
+- **Invariant vertex position.** Leaf litter and grass showed horizontal bands where a decal meets the ground. That
+  is z-fighting: Sodium draws the two with separately compiled copies of one vertex shader, and a mobile GPU compiler
+  may fuse a multiply and an add in one copy and not the other. The translator now adds the SPIR-V `Invariant`
+  decoration to `gl_Position` of every vertex shader, which SPIRV-Cross prints as `invariant gl_Position;`.
+  `"invariantPosition": 0` in `config.json` turns it off. Translated shaders are cached by a hash of their source, so
+  the cache file is renamed (`glsl_cache_inv1.tmp`) to stop old output being served. Not yet confirmed on a device.
+- **ANGLE pipeline cache.** With ANGLE on, the game thread waited inside draw calls and the present blit for tens of
+  milliseconds (about a third of the slow frames in a Spike Catcher log). ANGLE's Vulkan backend compiles each
+  pipeline on first use, and nothing saved the result, so every launch started cold. The renderer now gives ANGLE
+  storage through `EGL_ANDROID_blob_cache`: one file per entry in `<MG dir>/angle_cache`, written from a background
+  thread. The log says `[angle-cache] pipelines are kept in ...`, then `hit` lines on the next launch if it works,
+  or `not available` with the reason. `"angleBlobCache": 0` turns it off. Not yet confirmed on a device.
+
 ## App changes
 
 `app-patches/0001-dot-matrix-theme-and-tuning-features.patch` changes the plugin app itself (Material style only):
