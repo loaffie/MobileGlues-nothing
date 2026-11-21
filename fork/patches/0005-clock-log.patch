@@ -1,0 +1,234 @@
+diff --git a/MobileGlues-cpp/gl/frametime.cpp b/MobileGlues-cpp/gl/frametime.cpp
+index ab5a84c..4072fc7 100644
+--- a/MobileGlues-cpp/gl/frametime.cpp
++++ b/MobileGlues-cpp/gl/frametime.cpp
+@@ -256,6 +256,203 @@ double ms(uint64_t ns) {
+     return static_cast<double>(ns) / 1e6;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Clock log
++//
++// Once a second the render thread reads the CPU and GPU clocks, and the speed
++// limits the thermal governor has put on them. The 30 s summary then prints what
++// they did. It answers a question the frame times cannot: did the phone slow
++// itself down? Files the app is not allowed to read are skipped, and the line
++// says which ones were missing.
++// ---------------------------------------------------------------------------
++const int MAX_CLUSTERS = 4;
++const int MAX_ZONES = 8;
++const uint64_t CLOCK_SAMPLE_NS = 1000000000ull;
++
++struct clock_state_t {
++    bool probed = false;
++    int clusters = 0;
++    int cpu[MAX_CLUSTERS] = {};
++    long cpu_max_khz[MAX_CLUSTERS] = {};
++    const char* gpu_clk = nullptr;
++    int zones_cpu[MAX_ZONES] = {};
++    int zones_gpu[MAX_ZONES] = {};
++    int n_zones_cpu = 0;
++    int n_zones_gpu = 0;
++
++    uint64_t last_ns = 0;
++    uint32_t n = 0;
++    double cpu_sum[MAX_CLUSTERS] = {};
++    long cpu_min[MAX_CLUSTERS] = {};
++    long cpu_cap_min[MAX_CLUSTERS] = {};
++    uint32_t gpu_n = 0;
++    double gpu_sum = 0.0;
++    long gpu_min = 0;
++    long gpu_cap_min = 0;
++    uint32_t busy_n = 0;
++    double busy_sum = 0.0;
++    long temp_cpu_max = 0;
++    long temp_gpu_max = 0;
++};
++
++thread_local clock_state_t t_clk;
++
++#ifdef __ANDROID__
++long read_long(const char* path) {
++    FILE* f = std::fopen(path, "r");
++    if (!f) return -1;
++    long v = -1;
++    if (std::fscanf(f, "%ld", &v) != 1) v = -1;
++    std::fclose(f);
++    return v;
++}
++
++// Qualcomm reports millidegrees, some kernels whole degrees.
++long read_temp_c(int zone) {
++    char path[96];
++    std::snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", zone);
++    const long t = read_long(path);
++    if (t < 0) return -1;
++    return t > 1000 ? t / 1000 : t;
++}
++
++void clock_probe() {
++    clock_state_t& c = t_clk;
++    if (c.probed) return;
++    c.probed = true;
++
++    const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
++    for (int cpu = 0; cpu < ncpu && cpu < CPU_SETSIZE; ++cpu) {
++        const long m = read_cpu_max_khz(cpu);
++        if (m <= 0) continue;
++        bool known = false;
++        for (int i = 0; i < c.clusters; ++i)
++            if (c.cpu_max_khz[i] == m) known = true;
++        if (known || c.clusters >= MAX_CLUSTERS) continue;
++        c.cpu[c.clusters] = cpu;
++        c.cpu_max_khz[c.clusters] = m;
++        c.clusters += 1;
++    }
++
++    static const char* const gpu_paths[] = {"/sys/class/kgsl/kgsl-3d0/gpuclk",
++                                           "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq"};
++    for (const char* path : gpu_paths) {
++        if (read_long(path) > 0) {
++            c.gpu_clk = path;
++            break;
++        }
++    }
++
++    for (int z = 0; z < 100; ++z) {
++        char path[96];
++        std::snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", z);
++        FILE* f = std::fopen(path, "r");
++        if (!f) continue;
++        char type[48] = {};
++        const bool got = std::fgets(type, sizeof(type), f) != nullptr;
++        std::fclose(f);
++        if (!got || read_temp_c(z) < 0) continue;
++        if (std::strncmp(type, "gpuss", 5) == 0 && c.n_zones_gpu < MAX_ZONES) c.zones_gpu[c.n_zones_gpu++] = z;
++        else if (std::strncmp(type, "cpu", 3) == 0 && c.n_zones_cpu < MAX_ZONES) c.zones_cpu[c.n_zones_cpu++] = z;
++    }
++}
++
++void clock_reset() {
++    clock_state_t& c = t_clk;
++    c.n = c.gpu_n = c.busy_n = 0;
++    c.gpu_sum = c.busy_sum = 0.0;
++    c.gpu_min = c.gpu_cap_min = -1;
++    c.temp_cpu_max = c.temp_gpu_max = -1;
++    for (int i = 0; i < MAX_CLUSTERS; ++i) {
++        c.cpu_sum[i] = 0.0;
++        c.cpu_min[i] = c.cpu_cap_min[i] = -1;
++    }
++}
++
++void keep_min(long& slot, long v) {
++    if (v > 0 && (slot < 0 || v < slot)) slot = v;
++}
++
++void clock_sample(uint64_t now) {
++    clock_state_t& c = t_clk;
++    if (!c.probed || now - c.last_ns < CLOCK_SAMPLE_NS) return;
++    c.last_ns = now;
++    c.n += 1;
++
++    for (int i = 0; i < c.clusters; ++i) {
++        char path[96];
++        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c.cpu[i]);
++        const long cur = read_long(path);
++        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", c.cpu[i]);
++        const long cap = read_long(path);
++        if (cur > 0) {
++            c.cpu_sum[i] += static_cast<double>(cur);
++            keep_min(c.cpu_min[i], cur);
++        }
++        keep_min(c.cpu_cap_min[i], cap);
++    }
++
++    if (c.gpu_clk) {
++        const long hz = read_long(c.gpu_clk);
++        if (hz > 0) {
++            c.gpu_n += 1;
++            c.gpu_sum += static_cast<double>(hz);
++            keep_min(c.gpu_min, hz);
++        }
++        keep_min(c.gpu_cap_min, read_long("/sys/class/kgsl/kgsl-3d0/max_gpuclk"));
++        const long busy = read_long("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
++        if (busy >= 0) {
++            c.busy_n += 1;
++            c.busy_sum += static_cast<double>(busy);
++        }
++    }
++
++    for (int i = 0; i < c.n_zones_cpu; ++i) {
++        const long t = read_temp_c(c.zones_cpu[i]);
++        if (t > c.temp_cpu_max) c.temp_cpu_max = t;
++    }
++    for (int i = 0; i < c.n_zones_gpu; ++i) {
++        const long t = read_temp_c(c.zones_gpu[i]);
++        if (t > c.temp_gpu_max) c.temp_gpu_max = t;
++    }
++}
++
++void clock_report() {
++    const clock_state_t& c = t_clk;
++    if (c.n == 0) return;
++    char line[512];
++    int len = 0;
++    auto add = [&](const char* fmt, auto... args) {
++        if (len < static_cast<int>(sizeof(line)) - 1)
++            len += std::snprintf(line + len, sizeof(line) - len, fmt, args...);
++    };
++    add("%s", "cpu MHz avg/min (limit)");
++    for (int i = 0; i < c.clusters; ++i) {
++        if (c.cpu_min[i] < 0) {
++            add(" | cpu%d unreadable", c.cpu[i]);
++            continue;
++        }
++        add(" | cpu%d %.0f/%ld (%ld)", c.cpu[i], c.cpu_sum[i] / c.n / 1000.0, c.cpu_min[i] / 1000,
++            c.cpu_cap_min[i] / 1000);
++    }
++    if (c.gpu_n > 0) {
++        add(" | gpu MHz %.0f/%ld", c.gpu_sum / c.gpu_n / 1e6, c.gpu_min / 1000000);
++        if (c.gpu_cap_min > 0) add(" (limit %ld)", c.gpu_cap_min / 1000000);
++        if (c.busy_n > 0) add(", busy %.0f%%", c.busy_sum / c.busy_n);
++    } else {
++        add("%s", " | gpu clock unreadable");
++    }
++    if (c.temp_cpu_max >= 0) add(" | cpu %ld C", c.temp_cpu_max);
++    if (c.temp_gpu_max >= 0) add(" | gpu %ld C", c.temp_gpu_max);
++    LOG_V("[clocks] %u samples | %s", c.n, line)
++}
++#else
++void clock_probe() {}
++void clock_reset() {}
++void clock_sample(uint64_t) {}
++void clock_report() {}
++#endif
++
+ } // namespace
+ 
+ // ---------------------------------------------------------------------------
+@@ -321,6 +518,7 @@ void mg_frame_pace() {
+ void mg_frame_presented() {
+     read_config_once();
+     pin_render_thread_once();
++    if (g_cfg_hitch_log) clock_probe();
+ 
+     pacing_state_t& p = t_pacing;
+     mg_ft_frame_t frame = g_mg_ft_frame;
+@@ -389,7 +587,9 @@ void mg_frame_presented() {
+         p.win_hitch_ms = 0.0;
+         for (int i = 0; i < MG_FT_COUNT; ++i)
+             p.win_ns[i] = p.win_hitch_ns[i] = 0;
++        clock_reset();
+     }
++    clock_sample(now);
+     p.win_frames += 1;
+     p.win_sum_ms += dt;
+     if (dt > p.win_max_ms) p.win_max_ms = dt;
+@@ -406,6 +606,7 @@ void mg_frame_presented() {
+         const double avg = p.win_sum_ms / p.win_frames;
+         LOG_V("[frametime] %u frames in 30 s | avg %.2f ms (%.0f fps) | worst %.1f ms | hitches %u", p.win_frames,
+               avg, avg > 0.0 ? 1000.0 / avg : 0.0, p.win_max_ms, p.win_hitches)
++        clock_report();
+         // The same split as a [hitch] line, summed: once over every frame of the
+         // window and once over its hitches. This is what survives the per-hitch
+         // line limit, and what makes two runs comparable.

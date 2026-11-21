@@ -60,6 +60,18 @@ Both can be changed in `/sdcard/MG/config.json`:
 - The log now times `glBlitFramebuffer` (`blit`; Minecraft 1.21 presents with it, and under ANGLE that is where the
   next window image is acquired) and the cap's wait (`pace`) separately.
 
+`patches/0005-clock-log.patch` (`gl/frametime.cpp`)
+
+- **Clock log.** Once a second the render thread reads each CPU cluster's current clock and its limit, the GPU
+  clock and its limit, GPU busy percent, and the hottest CPU and GPU thermal zones. Every 30 s the summary adds one
+  line, so a drop in FPS can be matched to the phone slowing itself down:
+
+      [clocks] 30 samples | cpu MHz avg/min (limit) | cpu0 1786/1786 (1786) | cpu4 2496/2112 (2496) | cpu7 2995/2227 (2995) | gpu MHz 818/645 (limit 818), busy 71% | cpu 62 C | gpu 58 C
+
+  The GPU numbers come from `/sys/class/kgsl/kgsl-3d0` (Adreno only) and the temperatures from
+  `/sys/class/thermal`. An app is not always allowed to read those; what cannot be read is left out, and a missing
+  GPU clock prints `gpu clock unreadable`. Runs at `hitchLog` 1 and 2.
+
 ## App changes
 
 `app-patches/0001-dot-matrix-theme-and-tuning-features.patch` changes the plugin app itself (Material style only):
